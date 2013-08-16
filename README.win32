@@ -41,3 +41,16 @@ Limitation
  - Use forward slashes. Backslash support is very limited.
  - Do not do wild things with Windows drive notation, like archiving a
    whole drive. If you want it, tell us, preferably with patches.
+ - The built binary so far only been found to successfully work on:
+ 
+    - XP x64 SP1 (NT version 5.2.3790.1830)
+    - XP x64 SP2 (NT version 5.2.3790.3959)
+    
+ - It has not yet been tested on:
+    - Vista SP2 (NT version 6.1.7601.????)
+    
+ - It has been tested, but found to be not currently not working on:
+ 
+    - 7 x64 SP1 (NT version 6.1.7601.18205)
+    - 8 x64     (NT version 6.2.9200.16551)
+   

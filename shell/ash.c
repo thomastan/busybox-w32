@@ -7747,7 +7747,7 @@ tryexec(IF_FEATURE_SH_STANDALONE(int applet_no,) char *cmd, char **argv, char **
 {
 #if ENABLE_FEATURE_SH_STANDALONE
 	if (applet_no >= 0) {
-		if (APPLET_IS_NOEXEC(applet_no)) {
+		if (APPLET_IS_NOEXEC(applet_no) && !_WIN64) {
 			clearenv();
 			while (*envp)
 				putenv(*envp++);

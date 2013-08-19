@@ -185,7 +185,9 @@ spawnveq(int mode, const char *path, const char *const *argv, const char *const 
 	for (i = 0;i < argc;i++)
 		new_argv[i] = quote_arg(argv[i]);
 	new_argv[argc] = NULL;
-	ret = spawnve(mode, path, (const char *const *)new_argv, env);
+	ret = spawnv(mode, path, (const char *const *)new_argv);
+	/* the spawnve() function keeps giving a bad return value on win64 systems,
+	 * possibly because the env array does not contain env[last] == NULL */
 	for (i = 0;i < argc;i++)
 		if (new_argv[i] != argv[i])
 			free(new_argv[i]);

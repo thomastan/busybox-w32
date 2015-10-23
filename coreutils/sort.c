@@ -25,14 +25,14 @@
 //usage:     "\n	-f	Ignore case"
 //usage:     "\n	-g	General numerical sort"
 //usage:     "\n	-i	Ignore unprintable characters"
-//usage:     "\n	-k	Sort key"
 //usage:     "\n	-M	Sort month"
 //usage:	)
+//-h, --human-numeric-sort: compare human readable numbers (e.g., 2K 1G)
 //usage:     "\n	-n	Sort numbers"
 //usage:	IF_FEATURE_SORT_BIG(
 //usage:     "\n	-o	Output to file"
-//usage:     "\n	-k	Sort by key"
-//usage:     "\n	-t CHAR	Key separator"
+//usage:     "\n	-t CHAR	Field separator"
+//usage:     "\n	-k N[,M] Sort by Nth field"
 //usage:	)
 //usage:     "\n	-r	Reverse sort order"
 //usage:	IF_FEATURE_SORT_BIG(
@@ -143,6 +143,9 @@ static char *get_key(char *str, struct sort_key *key, int flags)
 					}
 				}
 			}
+			/* Remove last delim: "abc:def:" => "abc:def" */
+			if (key_separator && j && end != 0)
+				end--;
 		}
 		if (!j) start = end;
 	}
@@ -163,7 +166,8 @@ static char *get_key(char *str, struct sort_key *key, int flags)
 		if (start > len) start = len;
 	}
 	/* Make the copy */
-	if (end < start) end = start;
+	if (end < start)
+		end = start;
 	str = xstrndup(str+start, end-start);
 	/* Handle -d */
 	if (flags & FLAG_d) {
@@ -225,7 +229,7 @@ static int compare_keys(const void *xarg, const void *yarg)
 		y = *(char **)yarg;
 #endif
 		/* Perform actual comparison */
-		switch (flags & 7) {
+		switch (flags & (FLAG_n | FLAG_M | FLAG_g)) {
 		default:
 			bb_error_msg_and_die("unknown sort type");
 			break;
@@ -302,10 +306,14 @@ static int compare_keys(const void *xarg, const void *yarg)
 	} /* for */
 
 	/* Perform fallback sort if necessary */
-	if (!retval && !(option_mask32 & FLAG_s))
+	if (!retval && !(option_mask32 & FLAG_s)) {
 		retval = strcmp(*(char **)xarg, *(char **)yarg);
+		flags = option_mask32;
+	}
 
-	if (flags & FLAG_r) return -retval;
+	if (flags & FLAG_r)
+		return -retval;
+
 	return retval;
 }
 

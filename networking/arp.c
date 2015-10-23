@@ -68,7 +68,6 @@ struct globals {
 	const struct hwtype *hw; /* current hardware type */
 	const char *device;      /* current device */
 	smallint hw_set;         /* flag if hw-type was set (-H) */
-
 } FIX_ALIASING;
 #define G (*(struct globals*)&bb_common_bufsiz1)
 #define ap         (G.ap        )
@@ -459,12 +458,12 @@ static int arp_show(char *name)
 		arp_disp(hostname, ip, type, flags, hwa, mask, dev);
 	}
 	if (option_mask32 & ARP_OPT_v)
-		printf("Entries: %d\tSkipped: %d\tFound: %d\n",
+		printf("Entries: %u\tSkipped: %u\tFound: %u\n",
 				entries, entries - shown, shown);
 
 	if (!shown) {
 		if (hw_set || host || device[0])
-			printf("No match found in %d entries\n", entries);
+			printf("No match found in %u entries\n", entries);
 	}
 	if (ENABLE_FEATURE_CLEAN_UP) {
 		free((char*)host);

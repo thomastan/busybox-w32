@@ -30,6 +30,15 @@
  *        a  directory:  $TMPDIR, if set; else the directory specified via
  *        -p; else /tmp [deprecated]
  */
+//config:config MKTEMP
+//config:	bool "mktemp"
+//config:	default y
+//config:	help
+//config:	  mktemp is used to create unique temporary files
+
+//applet:IF_MKTEMP(APPLET(mktemp, BB_DIR_BIN, BB_SUID_DROP))
+
+//kbuild:lib-$(CONFIG_MKTEMP) += mktemp.o
 
 //usage:#define mktemp_trivial_usage
 //usage:       "[-dt] [-p DIR] [TEMPLATE]"
@@ -94,11 +103,7 @@ int mktemp_main(int argc UNUSED_PARAM, char **argv)
 
 	if (opts & OPT_u) {
 		chp = mktemp(chp);
-#if !ENABLE_PLATFORM_MINGW32
 		if (chp[0] == '\0')
-#else
-		if (chp == NULL || chp[0] == '\0')
-#endif
 			goto error;
 	} else if (opts & OPT_d) {
 		if (mkdtemp(chp) == NULL)

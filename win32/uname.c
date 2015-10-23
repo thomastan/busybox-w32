@@ -7,22 +7,12 @@ int uname(struct utsname *name)
 	const char *unk = "unknown";
 	OSVERSIONINFO os_info;
 	SYSTEM_INFO sys_info;
-#if !ENABLE_WIN32_NET
-	DWORD len;
-#endif
 
 	strcpy(name->sysname, "Windows_NT");
 
-#if ENABLE_WIN32_NET
 	if ( gethostname(name->nodename, sizeof(name->nodename)) != 0 ) {
 		strcpy(name->nodename, unk);
 	}
-#else
-	len = sizeof(name->nodename) - 1;
-	if ( !GetComputerName(name->nodename, &len) ) {
-		strcpy(name->nodename, unk);
-	}
-#endif
 
 	memset(&os_info, 0, sizeof(OSVERSIONINFO));
 	os_info.dwOSVersionInfoSize = sizeof(OSVERSIONINFO);
@@ -30,9 +20,9 @@ int uname(struct utsname *name)
 	strcpy(name->release, unk);
 	strcpy(name->version, unk);
 	if (GetVersionEx(&os_info)) {
-		sprintf(name->release, "%d.%d", os_info.dwMajorVersion,
-				os_info.dwMinorVersion);
-		sprintf(name->version, "%d", os_info.dwBuildNumber);
+		sprintf(name->release, "%u.%u", (unsigned int)os_info.dwMajorVersion,
+				(unsigned int)os_info.dwMinorVersion);
+		sprintf(name->version, "%u", (unsigned int)os_info.dwBuildNumber);
 	}
 
 	strcpy(name->machine, unk);

@@ -27,7 +27,7 @@
  * - both / and \ are supported in PATH. Usually you must use /
  * - trap/job does not work
  * - /dev/null is supported for redirection
- * - no $PPID
+ * - fake $PPID
  */
 
 /*
@@ -51,13 +51,11 @@
 
 #define JOBS ENABLE_ASH_JOB_CONTROL
 
-#include "busybox.h" /* for applet_names */
-#if !ENABLE_PLATFORM_MINGW32
 #include <paths.h>
-#endif
 #include <setjmp.h>
 #include <fnmatch.h>
 #include <sys/times.h>
+#include <sys/utsname.h> /* for setting $HOSTNAME */
 
 #include "busybox.h" /* for applet_names */
 #include "unicode.h"
@@ -163,6 +161,13 @@
 //config:	help
 //config:	  Enable support for test builtin in ash.
 //config:
+//config:config ASH_HELP
+//config:	bool "help builtin"
+//config:	default y
+//config:	depends on ASH
+//config:	help
+//config:	  Enable help builtin in ash.
+//config:
 //config:config ASH_CMDCMD
 //config:	bool "'command' command to override shell builtins"
 //config:	default y
@@ -215,36 +220,45 @@
 //kbuild:lib-$(CONFIG_ASH_RANDOM_SUPPORT) += random.o
 
 #if ENABLE_PLATFORM_MINGW32
-struct forkshell;
 union node;
 struct strlist;
 struct job;
 
-typedef void (*forkpoint_fn)(struct forkshell *fs);
 struct forkshell {
 	/* filled by forkshell_copy() */
 	struct globals_var *gvp;
 	struct globals_misc *gmp;
 	struct tblentry **cmdtable;
-	struct localvar *localvars;
 	/* struct alias **atab; */
 	/* struct parsefile *g_parsefile; */
-	int fpid;
 	HANDLE hMapFile;
 	void *old_base;
 	int nodeptr_offset;
 	int size;
 
-	forkpoint_fn fp;
-	/* optional data, used by forkpoint_fn */
+	/* type of forkshell */
+	int fpid;
+
+	/* optional data, used by forkshell_child */
 	int flags;
 	int fd[10];
 	union node *n;
 	char **argv;
 	char *string;
 	struct strlist *strlist;
-	pid_t pid;
 };
+
+enum {
+	FS_OPENHERE,
+	FS_EVALBACKCMD,
+	FS_EVALSUBSHELL,
+	FS_EVALPIPE,
+	FS_SHELLEXEC
+};
+
+static struct forkshell* forkshell_prepare(struct forkshell *fs);
+static void forkshell_init(const char *idstr);
+static void forkshell_child(struct forkshell *fs);
 static void sticky_free(void *p);
 #define free(p) sticky_free(p)
 static int spawn_forkshell(struct job *jp, struct forkshell *fs, int mode);
@@ -283,6 +297,7 @@ static const char *const optletters_optnames[] = {
 #endif
 #if ENABLE_PLATFORM_MINGW32
 	,"\0"  "noconsole"
+	,"X"   "winxp"
 #endif
 };
 
@@ -366,6 +381,7 @@ struct globals_misc {
 #endif
 #if ENABLE_PLATFORM_MINGW32
 # define noconsole optlist[14 + ENABLE_ASH_BASH_COMPAT + 2*DEBUG]
+# define winxp optlist[15 + ENABLE_ASH_BASH_COMPAT + 2*DEBUG]
 #endif
 
 	/* trap handler commands */
@@ -591,11 +607,12 @@ flush_stdout_stderr(void)
 	INT_ON;
 }
 
+/* Was called outcslow(c,FILE*), but c was always '\n' */
 static void
-outcslow(int c, FILE *dest)
+newline_and_flush(FILE *dest)
 {
 	INT_OFF;
-	putc(c, dest);
+	putc('\n', dest);
 	fflush(dest);
 	INT_ON;
 }
@@ -652,8 +669,6 @@ out2str(const char *p)
 #define CTLVAR       ((unsigned char)'\202')    /* variable defn */
 #define CTLENDVAR    ((unsigned char)'\203')
 #define CTLBACKQ     ((unsigned char)'\204')
-#define CTLQUOTE 01             /* ored with CTLBACKQ code if in quotes */
-/*      CTLBACKQ | CTLQUOTE == '\205' */
 #define CTLARI       ((unsigned char)'\206')    /* arithmetic expression */
 #define CTLENDARI    ((unsigned char)'\207')
 #define CTLQUOTEMARK ((unsigned char)'\210')
@@ -662,7 +677,6 @@ out2str(const char *p)
 /* variable substitution byte (follows CTLVAR) */
 #define VSTYPE  0x0f            /* type of variable substitution */
 #define VSNUL   0x10            /* colon--treat the empty string as unset */
-#define VSQUOTE 0x80            /* inside double quotes--suppress splitting */
 
 /* values of VSTYPE field */
 #define VSNORMAL        0x1     /* normal variable:  $var or ${var} */
@@ -682,8 +696,9 @@ out2str(const char *p)
 #endif
 
 static const char dolatstr[] ALIGN1 = {
-	CTLVAR, VSNORMAL|VSQUOTE, '@', '=', '\0'
+	CTLQUOTEMARK, CTLVAR, VSNORMAL, '@', '=', CTLQUOTEMARK, '\0'
 };
+#define DOLATSTRLEN 6
 
 #define NCMD      0
 #define NPIPE     1
@@ -919,9 +934,7 @@ trace_puts_quoted(char *s)
 		case '\\': c = '\\'; goto backslash;
 		case CTLESC: c = 'e'; goto backslash;
 		case CTLVAR: c = 'v'; goto backslash;
-		case CTLVAR+CTLQUOTE: c = 'V'; goto backslash;
 		case CTLBACKQ: c = 'q'; goto backslash;
-		case CTLBACKQ+CTLQUOTE: c = 'Q'; goto backslash;
  backslash:
 			putc('\\', tracefile);
 			putc(c, tracefile);
@@ -1084,7 +1097,6 @@ sharg(union node *arg, FILE *fp)
 			putc('}', fp);
 			break;
 		case CTLBACKQ:
-		case CTLBACKQ|CTLQUOTE:
 			putc('$', fp);
 			putc('(', fp);
 			shtree(bqlist->n, -1, NULL, fp);
@@ -1261,7 +1273,7 @@ ash_vmsg(const char *msg, va_list ap)
 			fprintf(stderr, "line %d: ", startlinno);
 	}
 	vfprintf(stderr, msg, ap);
-	outcslow('\n', stderr);
+	newline_and_flush(stderr);
 }
 
 /*
@@ -2084,7 +2096,7 @@ varcmp(const char *p, const char *q)
 	int c, d;
 
 	while ((c = *p) == (d = *q)) {
-		if (!c || c == '=')
+		if (c == '\0' || c == '=')
 			goto out;
 		p++;
 		q++;
@@ -2180,6 +2192,22 @@ lookupvar(const char *name)
 			return var_end(v->var_text);
 	}
 	return NULL;
+}
+
+static void reinit_unicode_for_ash(void)
+{
+	/* Unicode support should be activated even if LANG is set
+	 * _during_ shell execution, not only if it was set when
+	 * shell was started. Therefore, re-check LANG every time:
+	 */
+	if (ENABLE_FEATURE_CHECK_UNICODE_IN_ENV
+	 || ENABLE_UNICODE_USING_LOCALE
+	) {
+		const char *s = lookupvar("LC_ALL");
+		if (!s) s = lookupvar("LC_CTYPE");
+		if (!s) s = lookupvar("LANG");
+		reinit_unicode(s);
+	}
 }
 
 /*
@@ -2285,7 +2313,7 @@ setvar(const char *name, const char *val, int flags)
 }
 
 static void FAST_FUNC
-setvar2(const char *name, const char *val)
+setvar0(const char *name, const char *val)
 {
 	setvar(name, val, 0);
 }
@@ -2348,7 +2376,7 @@ unsetvar(const char *s)
 			free(vp);
 			INT_ON;
 		} else {
-			setvar(s, 0, 0);
+			setvar0(s, NULL);
 			vp->flags &= ~VEXPORT;
 		}
  ok:
@@ -2574,6 +2602,7 @@ updatepwd(const char *dir)
 {
 #if ENABLE_PLATFORM_MINGW32
 #define is_path_sep(x) ((x) == '/' || (x) == '\\')
+#define is_unc_path(x) (is_path_sep(x[0]) && is_path_sep(x[1]))
 	/*
 	 * Due to Windows drive notion, getting pwd is a completely
 	 * different thing. Handle it in a separate routine
@@ -2584,10 +2613,11 @@ updatepwd(const char *dir)
 	char *cdcomppath;
 	const char *lim;
 	/*
-	 * There are four cases
+	 * There are five cases that make some kind of sense
 	 *  absdrive +  abspath: c:/path
 	 *  absdrive + !abspath: c:path
 	 * !absdrive +  abspath: /path
+	 * !absdrive +  uncpath: //host/share
 	 * !absdrive + !abspath: path
 	 *
 	 * Damn DOS!
@@ -2599,7 +2629,6 @@ updatepwd(const char *dir)
 	 */
 	int absdrive = *dir && dir[1] == ':';
 	int abspath = absdrive ? is_path_sep(dir[2]) : is_path_sep(*dir);
-	char *drive;
 
 	cdcomppath = ststrdup(dir);
 	STARTSTACKSTR(new);
@@ -2612,19 +2641,25 @@ updatepwd(const char *dir)
 	}
 	new = makestrspace(strlen(dir) + 2, new);
 
-	drive = stackblock();
-	if (absdrive) {
-		*drive = *dir;
-		cdcomppath += 2;
-		dir += 2;
-	} else {
-		*drive = *curdir;
+	if ( is_unc_path(dir) || (!absdrive && !abspath && is_unc_path(curdir)) ) {
+		lim = (char *)stackblock() + 1;
 	}
-	drive[1] = ':'; /* in case of absolute drive+path */
+	else {
+		char *drive = stackblock();
+		if (absdrive) {
+			*drive = *dir;
+			cdcomppath += 2;
+			dir += 2;
+		} else {
+			*drive = *curdir;
+		}
+		drive[1] = ':'; /* in case of absolute drive+path */
 
-	if (abspath)
-		new = drive + 2;
-	lim = drive + 3;
+		if (abspath)
+			new = drive + 2;
+		lim = drive + 3;
+	}
+
 	if (!abspath) {
 		if (!is_path_sep(new[-1]))
 			USTPUTC('/', new);
@@ -3494,6 +3529,7 @@ unaliascmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 #define SHOW_ONLY_PGID  0x01    /* show only pgid (jobs -p) */
 #define SHOW_PIDS       0x02    /* show individual pids, not just one line per job */
 #define SHOW_CHANGED    0x04    /* only jobs whose state has changed */
+#define SHOW_STDERR     0x08    /* print to stderr (else stdout) */
 
 /*
  * A job structure contains information about a job.  A job is either a
@@ -3530,7 +3566,9 @@ struct job {
 };
 
 static struct job *makejob(/*union node *,*/ int);
+#if !ENABLE_PLATFORM_MINGW32
 static int forkshell(struct job *, union node *, int);
+#endif
 static int waitforjob(struct job *);
 
 #if !JOBS
@@ -3802,7 +3840,7 @@ getjob(const char *name, int getctl)
 
 	if (is_number(p)) {
 		num = atoi(p);
-		if (num < njobs) {
+		if (num <= njobs) {
 			jp = jobtab + num - 1;
 			if (jp->used)
 				goto gotit;
@@ -4010,7 +4048,7 @@ showpipe(struct job *jp /*, FILE *out*/)
 	psend = jp->ps + jp->nprocs;
 	for (ps = jp->ps + 1; ps < psend; ps++)
 		printf(" | %s", ps->ps_cmd);
-	outcslow('\n', stdout);
+	newline_and_flush(stdout);
 	flush_stdout_stderr();
 }
 
@@ -4070,39 +4108,33 @@ fg_bgcmd(int argc UNUSED_PARAM, char **argv)
 #endif
 
 static int
-sprint_status(char *s, int status, int sigonly)
+sprint_status48(char *s, int status, int sigonly)
 {
 	int col;
 	int st;
 
 	col = 0;
 	if (!WIFEXITED(status)) {
-#if JOBS
-		if (WIFSTOPPED(status))
+		if (JOBS && WIFSTOPPED(status))
 			st = WSTOPSIG(status);
 		else
-#endif
 			st = WTERMSIG(status);
 		if (sigonly) {
 			if (st == SIGINT || st == SIGPIPE)
 				goto out;
-#if JOBS
-			if (WIFSTOPPED(status))
+			if (JOBS && WIFSTOPPED(status))
 				goto out;
-#endif
 		}
 		st &= 0x7f;
 //TODO: use bbox's get_signame? strsignal adds ~600 bytes to text+rodata
 		col = fmtstr(s, 32, strsignal(st));
 		if (WCOREDUMP(status)) {
-			col += fmtstr(s + col, 16, " (core dumped)");
+			strcpy(s + col, " (core dumped)");
+			col += sizeof(" (core dumped)")-1;
 		}
 	} else if (!sigonly) {
 		st = WEXITSTATUS(status);
-		if (st)
-			col = fmtstr(s, 16, "Done(%d)", st);
-		else
-			col = fmtstr(s, 16, "Done");
+		col = fmtstr(s, 16, (st ? "Done(%d)" : "Done"), st);
 	}
  out:
 	return col;
@@ -4188,7 +4220,6 @@ dowait(int wait_flags, struct job *job)
 	int status;
 	struct job *jp;
 	struct job *thisjob;
-	int state;
 
 	TRACE(("dowait(0x%x) called\n", wait_flags));
 
@@ -4210,11 +4241,12 @@ dowait(int wait_flags, struct job *job)
 	INT_OFF;
 	thisjob = NULL;
 	for (jp = curjob; jp; jp = jp->prev_job) {
+		int jobstate;
 		struct procstat *ps;
 		struct procstat *psend;
 		if (jp->state == JOBDONE)
 			continue;
-		state = JOBDONE;
+		jobstate = JOBDONE;
 		ps = jp->ps;
 		psend = ps + jp->nprocs;
 		do {
@@ -4228,41 +4260,41 @@ dowait(int wait_flags, struct job *job)
 					ps->ps_pid = -1;
 			}
 			if (ps->ps_status == -1)
-				state = JOBRUNNING;
+				jobstate = JOBRUNNING;
 #if JOBS
-			if (state == JOBRUNNING)
+			if (jobstate == JOBRUNNING)
 				continue;
 			if (WIFSTOPPED(ps->ps_status)) {
 				jp->stopstatus = ps->ps_status;
-				state = JOBSTOPPED;
+				jobstate = JOBSTOPPED;
 			}
 #endif
 		} while (++ps < psend);
-		if (thisjob)
-			goto gotjob;
-	}
+		if (!thisjob)
+			continue;
+
+		/* Found the job where one of its processes changed its state.
+		 * Is there at least one live and running process in this job? */
+		if (jobstate != JOBRUNNING) {
+			/* No. All live processes in the job are stopped
+			 * (JOBSTOPPED) or there are no live processes (JOBDONE)
+			 */
+			thisjob->changed = 1;
+			if (thisjob->state != jobstate) {
+				TRACE(("Job %d: changing state from %d to %d\n",
+					jobno(thisjob), thisjob->state, jobstate));
+				thisjob->state = jobstate;
 #if JOBS
-	if (!WIFSTOPPED(status))
+				if (jobstate == JOBSTOPPED)
+					set_curjob(thisjob, CUR_STOPPED);
 #endif
-		jobless--;
-	goto out;
-
- gotjob:
-	if (state != JOBRUNNING) {
-		thisjob->changed = 1;
-
-		if (thisjob->state != state) {
-			TRACE(("Job %d: changing state from %d to %d\n",
-				jobno(thisjob), thisjob->state, state));
-			thisjob->state = state;
-#if JOBS
-			if (state == JOBSTOPPED) {
-				set_curjob(thisjob, CUR_STOPPED);
 			}
-#endif
 		}
+		goto out;
 	}
-
+	/* The process wasn't found in job list */
+	if (JOBS && !WIFSTOPPED(status))
+		jobless--;
  out:
 	INT_ON;
 
@@ -4270,7 +4302,7 @@ dowait(int wait_flags, struct job *job)
 		char s[48 + 1];
 		int len;
 
-		len = sprint_status(s, status, 1);
+		len = sprint_status48(s, status, 1);
 		if (len) {
 			s[len] = '\n';
 			s[len + 1] = '\0';
@@ -4291,13 +4323,14 @@ blocking_wait_with_raise_on_sig(void)
 
 #if JOBS
 static void
-showjob(FILE *out, struct job *jp, int mode)
+showjob(struct job *jp, int mode)
 {
 	struct procstat *ps;
 	struct procstat *psend;
 	int col;
 	int indent_col;
-	char s[80];
+	char s[16 + 16 + 48];
+	FILE *out = (mode & SHOW_STDERR ? stderr : stdout);
 
 	ps = jp->ps;
 
@@ -4327,7 +4360,7 @@ showjob(FILE *out, struct job *jp, int mode)
 		int status = psend[-1].ps_status;
 		if (jp->state == JOBSTOPPED)
 			status = jp->stopstatus;
-		col += sprint_status(s + col, status, 0);
+		col += sprint_status48(s + col, status, 0);
 	}
 	/* By now, "[JOBID]*  [maybe PID] STATUS" is printed */
 
@@ -4354,7 +4387,7 @@ showjob(FILE *out, struct job *jp, int mode)
 				ps->ps_cmd
 		);
 	} while (++ps != psend);
-	outcslow('\n', out);
+	newline_and_flush(out);
 
 	jp->changed = 0;
 
@@ -4369,7 +4402,7 @@ showjob(FILE *out, struct job *jp, int mode)
  * statuses have changed since the last call to showjobs.
  */
 static void
-showjobs(FILE *out, int mode)
+showjobs(int mode)
 {
 	struct job *jp;
 
@@ -4381,7 +4414,7 @@ showjobs(FILE *out, int mode)
 
 	for (jp = curjob; jp; jp = jp->prev_job) {
 		if (!(mode & SHOW_CHANGED) || jp->changed) {
-			showjob(out, jp, mode);
+			showjob(jp, mode);
 		}
 	}
 }
@@ -4402,10 +4435,10 @@ jobscmd(int argc UNUSED_PARAM, char **argv)
 	argv = argptr;
 	if (*argv) {
 		do
-			showjob(stdout, getjob(*argv, 0), mode);
+			showjob(getjob(*argv, 0), mode);
 		while (*++argv);
 	} else {
-		showjobs(stdout, mode);
+		showjobs(mode);
 	}
 
 	return 0;
@@ -4650,11 +4683,7 @@ cmdputs(const char *s)
 				str = "${#";
 			else
 				str = "${";
-			if (!(subtype & VSQUOTE) == !(quoted & 1))
-				goto dostr;
-			quoted ^= 1;
-			c = '"';
-			break;
+			goto dostr;
 		case CTLENDVAR:
 			str = "\"}" + !(quoted & 1);
 			quoted >>= 1;
@@ -4662,9 +4691,6 @@ cmdputs(const char *s)
 			goto dostr;
 		case CTLBACKQ:
 			str = "$(...)";
-			goto dostr;
-		case CTLBACKQ+CTLQUOTE:
-			str = "\"$(...)\"";
 			goto dostr;
 #if ENABLE_SH_MATH_SUPPORT
 		case CTLARI:
@@ -4915,6 +4941,7 @@ commandtext(union node *n)
  *
  * Called with interrupts off.
  */
+#if !ENABLE_PLATFORM_MINGW32
 /*
  * Clear traps on a fork.
  */
@@ -5000,7 +5027,7 @@ forkchild(struct job *jp, union node *n, int mode)
 		 * Our solution: ONLY bare $(trap) or `trap` is special.
 		 */
 		/* Save trap handler strings for trap builtin to print */
-		trap_ptr = memcpy(xmalloc(sizeof(trap)), trap, sizeof(trap));
+		trap_ptr = xmemdup(trap, sizeof(trap));
 		/* Fall through into clearing traps */
 	}
 	clear_traps();
@@ -5063,6 +5090,7 @@ forkchild(struct job *jp, union node *n, int mode)
 		freejob(jp);
 	jobless = 0;
 }
+#endif
 
 /* Called after fork(), in parent */
 #if !JOBS
@@ -5106,14 +5134,13 @@ forkparent(struct job *jp, union node *n, int mode, pid_t pid)
 	}
 }
 
+#if !ENABLE_PLATFORM_MINGW32
 static int
 forkshell(struct job *jp, union node *n, int mode)
 {
 	int pid;
 
 	TRACE(("forkshell(%%%d, %p, %d) called\n", jobno(jp), n, mode));
-	if (ENABLE_PLATFORM_MINGW32)
-		return -1;
 
 	pid = fork();
 	if (pid < 0) {
@@ -5130,6 +5157,7 @@ forkshell(struct job *jp, union node *n, int mode)
 	}
 	return pid;
 }
+#endif
 
 /*
  * Wait for job to finish.
@@ -5317,33 +5345,6 @@ noclobberopen(const char *fname)
  */
 /* openhere needs this forward reference */
 static void expandhere(union node *arg, int fd);
-#if ENABLE_PLATFORM_MINGW32
-static void
-forkshell_openhere(struct forkshell *fs)
-{
-	union node *redir = fs->n;
-	int pip[2];
-
-	pip[0] = fs->fd[0];
-	pip[1] = fs->fd[1];
-
-	TRACE(("ash: subshell: %s\n",__PRETTY_FUNCTION__));
-
-	close(pip[0]);
-	ignoresig(SIGINT);  //signal(SIGINT, SIG_IGN);
-	ignoresig(SIGQUIT); //signal(SIGQUIT, SIG_IGN);
-	ignoresig(SIGHUP);  //signal(SIGHUP, SIG_IGN);
-	ignoresig(SIGTSTP); //signal(SIGTSTP, SIG_IGN);
-	signal(SIGPIPE, SIG_DFL);
-	if (redir->type == NHERE) {
-		size_t len = strlen(redir->nhere.doc->narg.text);
-		full_write(pip[1], redir->nhere.doc->narg.text, len);
-	} else /* NXHERE */
-		expandhere(redir->nhere.doc, pip[1]);
-	_exit(EXIT_SUCCESS);
-}
-#endif
-
 static int
 openhere(union node *redir)
 {
@@ -5362,14 +5363,13 @@ openhere(union node *redir)
 	}
 #if ENABLE_PLATFORM_MINGW32
 	memset(&fs, 0, sizeof(fs));
-	fs.fp = forkshell_openhere;
-	fs.flags = 0;
+	fs.fpid = FS_OPENHERE;
 	fs.n = redir;
 	fs.fd[0] = pip[0];
 	fs.fd[1] = pip[1];
 	if (spawn_forkshell(NULL, &fs, FORK_NOJOB) < 0)
 		ash_msg_and_raise_error("unable to spawn shell");
-#endif
+#else
 	if (forkshell((struct job *)NULL, (union node *)NULL, FORK_NOJOB) == 0) {
 		/* child */
 		close(pip[0]);
@@ -5384,6 +5384,7 @@ openhere(union node *redir)
 			expandhere(redir->nhere.doc, pip[1]);
 		_exit(EXIT_SUCCESS);
 	}
+#endif
  out:
 	close(pip[1]);
 	return pip[0];
@@ -5453,6 +5454,9 @@ openredirect(union node *redir)
 		f = open(fname, O_WRONLY|O_CREAT|O_APPEND, 0666);
 		if (f < 0)
 			goto ecreate;
+#if ENABLE_PLATFORM_MINGW32
+		lseek(f, 0, SEEK_END);
+#endif
 		break;
 	default:
 #if DEBUG
@@ -5808,7 +5812,7 @@ ash_arith(const char *s)
 	arith_t result;
 
 	math_state.lookupvar = lookupvar;
-	math_state.setvar    = setvar2;
+	math_state.setvar    = setvar0;
 	//math_state.endofname = endofname;
 
 	INT_OFF;
@@ -5829,18 +5833,23 @@ ash_arith(const char *s)
 #define EXP_VARTILDE    0x4     /* expand tildes in an assignment */
 #define EXP_REDIR       0x8     /* file glob for a redirection (1 match only) */
 #define EXP_CASE        0x10    /* keeps quotes around for CASE pattern */
-#define EXP_RECORD      0x20    /* need to record arguments for ifs breakup */
+#define EXP_QPAT        0x20    /* pattern in quoted parameter expansion */
 #define EXP_VARTILDE2   0x40    /* expand tildes after colons only */
 #define EXP_WORD        0x80    /* expand word in parameter expansion */
-#define EXP_QWORD       0x100   /* expand word in quoted parameter expansion */
+#define EXP_QUOTED      0x100   /* expand word in double quotes */
 /*
  * rmescape() flags
  */
 #define RMESCAPE_ALLOC  0x1     /* Allocate a new string */
 #define RMESCAPE_GLOB   0x2     /* Add backslashes for glob */
-#define RMESCAPE_QUOTED 0x4     /* Remove CTLESC unless in quotes */
 #define RMESCAPE_GROW   0x8     /* Grow strings instead of stalloc */
 #define RMESCAPE_HEAP   0x10    /* Malloc strings instead of stalloc */
+#define RMESCAPE_SLASH  0x20    /* Stop globbing after slash */
+
+/* Add CTLESC when necessary. */
+#define QUOTES_ESC     (EXP_FULL | EXP_CASE | EXP_QPAT | EXP_REDIR)
+/* Do not skip NUL characters. */
+#define QUOTES_KEEPNUL EXP_TILDE
 
 /*
  * Structure specifying which parts of the string should be searched
@@ -5882,8 +5891,8 @@ cvtnum(arith_t num)
 {
 	int len;
 
-	expdest = makestrspace(32, expdest);
-	len = fmtstr(expdest, 32, ARITH_FMT, num);
+	expdest = makestrspace(sizeof(arith_t)*3 + 2, expdest);
+	len = fmtstr(expdest, sizeof(arith_t)*3 + 2, ARITH_FMT, num);
 	STADJUST(len, expdest);
 	return len;
 }
@@ -5905,14 +5914,16 @@ esclen(const char *start, const char *p)
 static char *
 rmescapes(char *str, int flag)
 {
-	static const char qchars[] ALIGN1 = { CTLESC, CTLQUOTEMARK, '\0' };
+	static const char qchars[] ALIGN1 = {
+		IF_ASH_BASH_COMPAT('/',) CTLESC, CTLQUOTEMARK, '\0' };
 
 	char *p, *q, *r;
 	unsigned inquotes;
 	unsigned protect_against_glob;
 	unsigned globbing;
+	IF_ASH_BASH_COMPAT(unsigned slash = flag & RMESCAPE_SLASH;)
 
-	p = strpbrk(str, qchars);
+	p = strpbrk(str, qchars IF_ASH_BASH_COMPAT(+ !slash));
 	if (!p)
 		return str;
 
@@ -5939,13 +5950,11 @@ rmescapes(char *str, int flag)
 		}
 	}
 
-	inquotes = (flag & RMESCAPE_QUOTED) ^ RMESCAPE_QUOTED;
+	inquotes = 0;
 	globbing = flag & RMESCAPE_GLOB;
 	protect_against_glob = globbing;
 	while (*p) {
 		if ((unsigned char)*p == CTLQUOTEMARK) {
-// TODO: if no RMESCAPE_QUOTED in flags, inquotes never becomes 0
-// (alternates between RMESCAPE_QUOTED and ~RMESCAPE_QUOTED). Is it ok?
 // Note: both inquotes and protect_against_glob only affect whether
 // CTLESC,<ch> gets converted to <ch> or to \<ch>
 			inquotes = ~inquotes;
@@ -5953,17 +5962,23 @@ rmescapes(char *str, int flag)
 			protect_against_glob = globbing;
 			continue;
 		}
-		if (*p == '\\') {
+		if ((unsigned char)*p == CTLESC) {
+			p++;
+			if (protect_against_glob) {
+				*q++ = '\\';
+			}
+		} else if (*p == '\\' && !inquotes) {
 			/* naked back slash */
 			protect_against_glob = 0;
 			goto copy;
 		}
-		if ((unsigned char)*p == CTLESC) {
-			p++;
-			if (protect_against_glob && inquotes && *p != '/') {
-				*q++ = '\\';
-			}
+#if ENABLE_ASH_BASH_COMPAT
+		else if (*p == '/' && slash) {
+			/* stop handling globbing and mark location of slash */
+			globbing = slash = 0;
+			*p = CTLESC;
 		}
+#endif
 		protect_against_glob = globbing;
  copy:
 		*q++ = *p++;
@@ -5983,13 +5998,9 @@ rmescapes(char *str, int flag)
  * Returns an stalloced string.
  */
 static char *
-preglob(const char *pattern, int quoted, int flag)
+preglob(const char *pattern, int flag)
 {
-	flag |= RMESCAPE_GLOB;
-	if (quoted) {
-		flag |= RMESCAPE_QUOTED;
-	}
-	return rmescapes((char *)pattern, flag);
+	return rmescapes((char *)pattern, flag | RMESCAPE_GLOB);
 }
 
 /*
@@ -5998,29 +6009,36 @@ preglob(const char *pattern, int quoted, int flag)
 static void
 memtodest(const char *p, size_t len, int syntax, int quotes)
 {
-	char *q = expdest;
+	char *q;
 
-	q = makestrspace(quotes ? len * 2 : len, q);
+	if (!len)
+		return;
 
-	while (len--) {
+	q = makestrspace((quotes & QUOTES_ESC) ? len * 2 : len, expdest);
+
+	do {
 		unsigned char c = *p++;
-		if (c == '\0')
-			continue;
-		if (quotes) {
+		if (c) {
 			int n = SIT(c, syntax);
-			if (n == CCTL || n == CBACK)
+			if ((quotes & QUOTES_ESC) &&
+					((n == CCTL) ||
+					(((quotes & EXP_FULL) || syntax != BASESYNTAX) &&
+					n == CBACK)))
 				USTPUTC(CTLESC, q);
-		}
+		} else if (!(quotes & QUOTES_KEEPNUL))
+			continue;
 		USTPUTC(c, q);
-	}
+	} while (--len);
 
 	expdest = q;
 }
 
-static void
+static size_t
 strtodest(const char *p, int syntax, int quotes)
 {
-	memtodest(p, strlen(p), syntax, quotes);
+	size_t len = strlen(p);
+	memtodest(p, len, syntax, quotes);
+	return len;
 }
 
 /*
@@ -6093,8 +6111,7 @@ exptilde(char *startp, char *p, int flags)
 	char *name;
 	struct passwd *pw;
 	const char *home;
-	int quotes = flags & (EXP_FULL | EXP_CASE | EXP_REDIR);
-	int startloc;
+	int quotes = flags & QUOTES_ESC;
 
 	name = p + 1;
 
@@ -6118,8 +6135,6 @@ exptilde(char *startp, char *p, int flags)
 	if (*name == '\0') {
 		home = lookupvar("HOME");
 	} else {
-		if (ENABLE_PLATFORM_MINGW32)
-			goto lose;
 		pw = getpwnam(name);
 		if (pw == NULL)
 			goto lose;
@@ -6128,9 +6143,7 @@ exptilde(char *startp, char *p, int flags)
 	if (!home || !*home)
 		goto lose;
 	*p = c;
-	startloc = expdest - (char *)stackblock();
 	strtodest(home, SQSYNTAX, quotes);
-	recordregion(startloc, expdest - (char *)stackblock(), 0);
 	return p;
  lose:
 	*p = c;
@@ -6156,25 +6169,6 @@ static uint8_t back_exitstatus; /* exit status of backquoted command */
 #define EV_EXIT 01              /* exit after evaluating tree */
 static void evaltree(union node *, int);
 
-#if ENABLE_PLATFORM_MINGW32
-static void
-forkshell_evalbackcmd(struct forkshell *fs)
-{
-	union node *n = fs->n;
-	int pip[2] = {fs->fd[0], fs->fd[1]};
-
-	FORCE_INT_ON;
-	close(pip[0]);
-	if (pip[1] != 1) {
-		/*close(1);*/
-		copyfd(pip[1], 1 | COPYFD_EXACT);
-		close(pip[1]);
-	}
-	eflag = 0;
-	evaltree(n, EV_EXIT); /* actually evaltreenr... */
-	/* NOTREACHED */
-}
-#endif
 static void FAST_FUNC
 evalbackcmd(union node *n, struct backcmd *result)
 {
@@ -6199,13 +6193,13 @@ evalbackcmd(union node *n, struct backcmd *result)
 			ash_msg_and_raise_error("pipe call failed");
 		jp = makejob(/*n,*/ 1);
 #if ENABLE_PLATFORM_MINGW32
-		result->fs.fp = forkshell_evalbackcmd;
+		result->fs.fpid = FS_EVALBACKCMD;
 		result->fs.n = n;
 		result->fs.fd[0] = pip[0];
 		result->fs.fd[1] = pip[1];
 		if (spawn_forkshell(jp, &result->fs, FORK_NOJOB) < 0)
 			ash_msg_and_raise_error("unable to spawn shell");
-#endif
+#else
 		if (forkshell(jp, n, FORK_NOJOB) == 0) {
 			FORCE_INT_ON;
 			close(pip[0]);
@@ -6218,6 +6212,7 @@ evalbackcmd(union node *n, struct backcmd *result)
 			evaltree(n, EV_EXIT); /* actually evaltreenr... */
 			/* NOTREACHED */
 		}
+#endif
 		close(pip[1]);
 		result->fd = pip[0];
 		result->jp = jp;
@@ -6232,7 +6227,7 @@ evalbackcmd(union node *n, struct backcmd *result)
  * Expand stuff in backwards quotes.
  */
 static void
-expbackq(union node *cmd, int quoted, int quotes)
+expbackq(union node *cmd, int flag)
 {
 	struct backcmd in;
 	int i;
@@ -6240,7 +6235,7 @@ expbackq(union node *cmd, int quoted, int quotes)
 	char *p;
 	char *dest;
 	int startloc;
-	int syntax = quoted ? DQSYNTAX : BASESYNTAX;
+	int syntax = flag & EXP_QUOTED ? DQSYNTAX : BASESYNTAX;
 	struct stackmark smark;
 
 	INT_OFF;
@@ -6256,11 +6251,11 @@ expbackq(union node *cmd, int quoted, int quotes)
 	if (i == 0)
 		goto read;
 	for (;;) {
-		memtodest(p, i, syntax, quotes);
+		memtodest(p, i, syntax, flag & QUOTES_ESC);
  read:
 		if (in.fd < 0)
 			break;
-		i = nonblock_immune_read(in.fd, buf, sizeof(buf), /*loop_on_EINTR:*/ 1);
+		i = nonblock_immune_read(in.fd, buf, sizeof(buf));
 		TRACE(("expbackq: read returns %d\n", i));
 		if (i <= 0)
 			break;
@@ -6281,7 +6276,7 @@ expbackq(union node *cmd, int quoted, int quotes)
 		STUNPUTC(dest);
 	expdest = dest;
 
-	if (quoted == 0)
+	if (!(flag & EXP_QUOTED))
 		recordregion(startloc, dest - (char *)stackblock(), 0);
 	TRACE(("evalbackq: size:%d:'%.*s'\n",
 		(int)((dest - (char *)stackblock()) - startloc),
@@ -6295,11 +6290,10 @@ expbackq(union node *cmd, int quoted, int quotes)
  * evaluate, place result in (backed up) result, adjust string position.
  */
 static void
-expari(int quotes)
+expari(int flag)
 {
 	char *p, *start;
 	int begoff;
-	int flag;
 	int len;
 
 	/* ifsfree(); */
@@ -6337,16 +6331,14 @@ expari(int quotes)
 
 	removerecordregions(begoff);
 
-	flag = p[1];
-
 	expdest = p;
 
-	if (quotes)
-		rmescapes(p + 2, 0);
+	if (flag & QUOTES_ESC)
+		rmescapes(p + 1, 0);
 
-	len = cvtnum(ash_arith(p + 2));
+	len = cvtnum(ash_arith(p + 1));
 
-	if (flag != '"')
+	if (!(flag & EXP_QUOTED))
 		recordregion(begoff, begoff + len, 0);
 }
 #endif
@@ -6374,15 +6366,13 @@ argstr(char *p, int flags, struct strlist *var_str_list)
 		CTLESC,
 		CTLVAR,
 		CTLBACKQ,
-		CTLBACKQ | CTLQUOTE,
 #if ENABLE_SH_MATH_SUPPORT
 		CTLENDARI,
 #endif
 		'\0'
 	};
 	const char *reject = spclchars;
-	int quotes = flags & (EXP_FULL | EXP_CASE | EXP_REDIR); /* do CTLESC */
-	int breakall = flags & EXP_WORD;
+	int breakall = (flags & (EXP_WORD | EXP_QUOTED)) == EXP_WORD;
 	int inquotes;
 	size_t length;
 	int startloc;
@@ -6400,8 +6390,6 @@ argstr(char *p, int flags, struct strlist *var_str_list)
 		flags &= ~EXP_TILDE;
  tilde:
 		q = p;
-		if ((unsigned char)*q == CTLESC && (flags & EXP_QWORD))
-			q++;
 		if (*q == '~')
 			p = exptilde(p, q, flags);
 	}
@@ -6458,19 +6446,14 @@ argstr(char *p, int flags, struct strlist *var_str_list)
 		case CTLENDVAR: /* ??? */
 			goto breakloop;
 		case CTLQUOTEMARK:
+			inquotes ^= EXP_QUOTED;
 			/* "$@" syntax adherence hack */
-			if (!inquotes
-			 && memcmp(p, dolatstr, 4) == 0
-			 && (  p[4] == (char)CTLQUOTEMARK
-			    || (p[4] == (char)CTLENDVAR && p[5] == (char)CTLQUOTEMARK)
-			    )
-			) {
-				p = evalvar(p + 1, flags, /* var_str_list: */ NULL) + 1;
+			if (inquotes && !memcmp(p, dolatstr + 1, DOLATSTRLEN - 1)) {
+				p = evalvar(p + 1, flags | inquotes, /* var_str_list: */ NULL) + 1;
 				goto start;
 			}
-			inquotes = !inquotes;
  addquote:
-			if (quotes) {
+			if (flags & QUOTES_ESC) {
 				p--;
 				length++;
 				startloc++;
@@ -6479,22 +6462,30 @@ argstr(char *p, int flags, struct strlist *var_str_list)
 		case CTLESC:
 			startloc++;
 			length++;
+
+			/*
+			 * Quoted parameter expansion pattern: remove quote
+			 * unless inside inner quotes or we have a literal
+			 * backslash.
+			 */
+			if (((flags | inquotes) & (EXP_QPAT | EXP_QUOTED)) ==
+			    EXP_QPAT && *p != '\\')
+				break;
+
 			goto addquote;
 		case CTLVAR:
 			TRACE(("argstr: evalvar('%s')\n", p));
-			p = evalvar(p, flags, var_str_list);
+			p = evalvar(p, flags | inquotes, var_str_list);
 			TRACE(("argstr: evalvar:'%s'\n", (char *)stackblock()));
 			goto start;
 		case CTLBACKQ:
-			c = '\0';
-		case CTLBACKQ|CTLQUOTE:
-			expbackq(argbackq->n, c, quotes);
+			expbackq(argbackq->n, flags | inquotes);
 			argbackq = argbackq->next;
 			goto start;
 #if ENABLE_SH_MATH_SUPPORT
 		case CTLENDARI:
 			p--;
-			expari(quotes);
+			expari(flags | inquotes);
 			goto start;
 #endif
 		}
@@ -6624,60 +6615,17 @@ varunset(const char *end, const char *var, const char *umsg, int varflags)
 	ash_msg_and_raise_error("%.*s: %s%s", (int)(end - var - 1), var, msg, tail);
 }
 
-#if ENABLE_ASH_BASH_COMPAT
-static char *
-parse_sub_pattern(char *arg, int varflags)
-{
-	char *idx, *repl = NULL;
-	unsigned char c;
-
-	//char *org_arg = arg;
-	//bb_error_msg("arg:'%s' varflags:%x", arg, varflags);
-	idx = arg;
-	while (1) {
-		c = *arg;
-		if (!c)
-			break;
-		if (c == '/') {
-			/* Only the first '/' seen is our separator */
-			if (!repl) {
-				repl = idx + 1;
-				c = '\0';
-			}
-		}
-		*idx++ = c;
-		arg++;
-		/*
-		 * Example: v='ab\c'; echo ${v/\\b/_\\_\z_}
-		 * The result is a_\_z_c (not a\_\_z_c)!
-		 *
-		 * Enable debug prints in this function and you'll see:
-		 * ash: arg:'\\b/_\\_z_' varflags:d
-		 * ash: pattern:'\\b' repl:'_\_z_'
-		 * That is, \\b is interpreted as \\b, but \\_ as \_!
-		 * IOW: search pattern and replace string treat backslashes
-		 * differently! That is the reason why we check repl below:
-		 */
-		if (c == '\\' && *arg == '\\' && repl && !(varflags & VSQUOTE))
-			arg++; /* skip both '\', not just first one */
-	}
-	*idx = c; /* NUL */
-	//bb_error_msg("pattern:'%s' repl:'%s'", org_arg, repl);
-
-	return repl;
-}
-#endif /* ENABLE_ASH_BASH_COMPAT */
-
 static const char *
 subevalvar(char *p, char *varname, int strloc, int subtype,
-		int startloc, int varflags, int quotes, struct strlist *var_str_list)
+		int startloc, int varflags, int flag, struct strlist *var_str_list)
 {
 	struct nodelist *saveargbackq = argbackq;
+	int quotes = flag & QUOTES_ESC;
 	char *startp;
 	char *loc;
 	char *rmesc, *rmescend;
 	char *str;
-	IF_ASH_BASH_COMPAT(const char *repl = NULL;)
+	IF_ASH_BASH_COMPAT(char *repl = NULL;)
 	IF_ASH_BASH_COMPAT(int pos, len, orig_len;)
 	int saveherefd = herefd;
 	int amount, resetloc;
@@ -6689,7 +6637,8 @@ subevalvar(char *p, char *varname, int strloc, int subtype,
 	//		p, varname, strloc, subtype, startloc, varflags, quotes);
 
 	herefd = -1;
-	argstr(p, (subtype != VSASSIGN && subtype != VSQUESTION) ? EXP_CASE : 0,
+	argstr(p, EXP_TILDE | (subtype != VSASSIGN && subtype != VSQUESTION ?
+			(flag & (EXP_QUOTED | EXP_QPAT) ? EXP_QPAT : EXP_CASE) : 0),
 			var_str_list);
 	STPUTC('\0', expdest);
 	herefd = saveherefd;
@@ -6698,7 +6647,7 @@ subevalvar(char *p, char *varname, int strloc, int subtype,
 
 	switch (subtype) {
 	case VSASSIGN:
-		setvar(varname, startp, 0);
+		setvar0(varname, startp);
 		amount = startp - expdest;
 		STADJUST(amount, expdest);
 		return startp;
@@ -6746,7 +6695,15 @@ subevalvar(char *p, char *varname, int strloc, int subtype,
 				len = number(loc);
 			}
 		}
-		if (pos >= orig_len) {
+		if (pos < 0) {
+			/* ${VAR:$((-n)):l} starts n chars from the end */
+			pos = orig_len + pos;
+		}
+		if ((unsigned)pos >= orig_len) {
+			/* apart from obvious ${VAR:999999:l},
+			 * covers ${VAR:$((-9999999)):l} - result is ""
+			 * (bash-compat)
+			 */
 			pos = 0;
 			len = 0;
 		}
@@ -6793,7 +6750,17 @@ subevalvar(char *p, char *varname, int strloc, int subtype,
 	}
 	rmescend--;
 	str = (char *)stackblock() + strloc;
-	preglob(str, varflags & VSQUOTE, 0);
+	/*
+	 * Example: v='a\bc'; echo ${v/\\b/_\\_\z_}
+	 * The result is a_\_z_c (not a\_\_z_c)!
+	 *
+	 * The search pattern and replace string treat backslashes differently!
+	 * RMESCAPE_SLASH causes preglob to work differently on the pattern
+	 * and string.  It's only used on the first call.
+	 */
+	preglob(str, IF_ASH_BASH_COMPAT(
+		(subtype == VSREPLACE || subtype == VSREPLACEALL) && !repl ?
+			RMESCAPE_SLASH :) 0);
 
 #if ENABLE_ASH_BASH_COMPAT
 	workloc = expdest - (char *)stackblock();
@@ -6801,11 +6768,12 @@ subevalvar(char *p, char *varname, int strloc, int subtype,
 		char *idx, *end;
 
 		if (!repl) {
-			repl = parse_sub_pattern(str, varflags);
-			//bb_error_msg("repl:'%s'", repl);
-			if (!repl)
+			if ((repl=strchr(str, CTLESC)))
+				*repl++ = '\0';
+			else
 				repl = nullstr;
 		}
+		//bb_error_msg("str:'%s' repl:'%s'", str, repl);
 
 		/* If there's no pattern to match, return the expansion unmolested */
 		if (str[0] == '\0')
@@ -6938,12 +6906,15 @@ varvalue(char *name, int varflags, int flags, struct strlist *var_str_list)
 	const char *p;
 	int num;
 	int i;
-	int sepq = 0;
 	ssize_t len = 0;
+	int sep;
+	int quoted = flags & EXP_QUOTED;
 	int subtype = varflags & VSTYPE;
-	int quotes = flags & (EXP_FULL | EXP_CASE | EXP_REDIR);
-	int quoted = varflags & VSQUOTE;
+	int discard = subtype == VSPLUS || subtype == VSLENGTH;
+	int quotes = (discard ? 0 : (flags & QUOTES_ESC)) | QUOTES_KEEPNUL;
 	int syntax = quoted ? DQSYNTAX : BASESYNTAX;
+
+	sep = quoted ? ((flags & EXP_FULL) << CHAR_BIT) : 0;
 
 	switch (*name) {
 	case '$':
@@ -6979,7 +6950,7 @@ varvalue(char *name, int varflags, int flags, struct strlist *var_str_list)
 		break;
 	case '@': {
 		char **ap;
-		int sep;
+		char sepc;
 
 		if (quoted && (flags & EXP_FULL)) {
 			/* note: this is not meant as PEOF value */
@@ -6989,39 +6960,20 @@ varvalue(char *name, int varflags, int flags, struct strlist *var_str_list)
 		/* fall through */
 	case '*':
 		sep = ifsset() ? (unsigned char)(ifsval()[0]) : ' ';
-		i = SIT(sep, syntax);
-		if (quotes && (i == CCTL || i == CBACK))
-			sepq = 1;
  param:
 		ap = shellparam.p;
+		sepc = sep;
 		if (!ap)
 			return -1;
 		while ((p = *ap++) != NULL) {
-			size_t partlen;
-
-			partlen = strlen(p);
-			len += partlen;
-
-			if (!(subtype == VSPLUS || subtype == VSLENGTH))
-				memtodest(p, partlen, syntax, quotes);
+			len += strtodest(p, syntax, quotes);
 
 			if (*ap && sep) {
-				char *q;
-
 				len++;
-				if (subtype == VSPLUS || subtype == VSLENGTH) {
-					continue;
-				}
-				q = expdest;
-				if (sepq)
-					STPUTC(CTLESC, q);
-				/* note: may put NUL despite sep != 0
-				 * (see sep = 1 << CHAR_BIT above) */
-				STPUTC(sep, q);
-				expdest = q;
+				memtodest(&sepc, 1, syntax, quotes);
 			}
 		}
-		return len;
+		break;
 	} /* case '@' and '*' */
 	case '0':
 	case '1':
@@ -7070,13 +7022,19 @@ varvalue(char *name, int varflags, int flags, struct strlist *var_str_list)
 		if (!p)
 			return -1;
 
-		len = strlen(p);
-		if (!(subtype == VSPLUS || subtype == VSLENGTH))
-			memtodest(p, len, syntax, quotes);
-		return len;
+		len = strtodest(p, syntax, quotes);
+#if ENABLE_UNICODE_SUPPORT
+		if (subtype == VSLENGTH && len > 0) {
+			reinit_unicode_for_ash();
+			if (unicode_status == UNICODE_ON) {
+				len = unicode_strlen(p);
+			}
+		}
+#endif
+		break;
 	}
 
-	if (subtype == VSPLUS || subtype == VSLENGTH)
+	if (discard)
 		STADJUST(-len, expdest);
 	return len;
 }
@@ -7090,7 +7048,7 @@ evalvar(char *p, int flags, struct strlist *var_str_list)
 {
 	char varflags;
 	char subtype;
-	char quoted;
+	int quoted;
 	char easy;
 	char *var;
 	int patloc;
@@ -7099,7 +7057,7 @@ evalvar(char *p, int flags, struct strlist *var_str_list)
 
 	varflags = (unsigned char) *p++;
 	subtype = varflags & VSTYPE;
-	quoted = varflags & VSQUOTE;
+	quoted = flags & EXP_QUOTED;
 	var = p;
 	easy = (!quoted || (*var == '@' && shellparam.nparam));
 	startloc = expdest - (char *)stackblock();
@@ -7120,7 +7078,7 @@ evalvar(char *p, int flags, struct strlist *var_str_list)
 		if (varlen < 0) {
 			argstr(
 				p,
-				flags | (quoted ? EXP_TILDE|EXP_QWORD : EXP_TILDE|EXP_WORD),
+				flags | EXP_TILDE | EXP_WORD,
 				var_str_list
 			);
 			goto end;
@@ -7134,7 +7092,7 @@ evalvar(char *p, int flags, struct strlist *var_str_list)
 		if (varlen < 0) {
 			if (subevalvar(p, var, /* strloc: */ 0,
 					subtype, startloc, varflags,
-					/* quotes: */ 0,
+					/* quotes: */ flags & ~QUOTES_ESC,
 					var_str_list)
 			) {
 				varflags &= ~VSNUL;
@@ -7191,10 +7149,7 @@ evalvar(char *p, int flags, struct strlist *var_str_list)
 		STPUTC('\0', expdest);
 		patloc = expdest - (char *)stackblock();
 		if (NULL == subevalvar(p, /* varname: */ NULL, patloc, subtype,
-				startloc, varflags,
-				/* quotes: */ flags & (EXP_FULL | EXP_CASE | EXP_REDIR),
-				var_str_list)
-		) {
+				startloc, varflags, flags, var_str_list)) {
 			int amount = expdest - (
 				(char *)stackblock() + patloc - 1
 			);
@@ -7213,7 +7168,7 @@ evalvar(char *p, int flags, struct strlist *var_str_list)
 			unsigned char c = *p++;
 			if (c == CTLESC)
 				p++;
-			else if (c == CTLBACKQ || c == (CTLBACKQ|CTLQUOTE)) {
+			else if (c == CTLBACKQ) {
 				if (varlen >= 0)
 					argbackq = argbackq->next;
 			} else if (c == CTLVAR) {
@@ -7368,10 +7323,11 @@ expmeta(char *expdir, char *enddir, char *name)
 	struct dirent *dp;
 	int atend;
 	int matchdot;
+	int esc;
 
 	metaflag = 0;
 	start = name;
-	for (p = name; *p; p++) {
+	for (p = name; esc = 0, *p; p += esc + 1) {
 		if (*p == '*' || *p == '?')
 			metaflag = 1;
 		else if (*p == '[') {
@@ -7388,15 +7344,16 @@ expmeta(char *expdir, char *enddir, char *name)
 					break;
 				}
 			}
-		} else if (*p == '\\')
-			p++;
-		else if (*p == '/') {
-			if (metaflag)
-				goto out;
-			start = p + 1;
+		} else {
+			if (*p == '\\')
+				esc++;
+			if (p[esc] == '/') {
+				if (metaflag)
+					break;
+				start = p + esc + 1;
+			}
 		}
 	}
- out:
 	if (metaflag == 0) {    /* we've reached the end of the file name */
 		if (enddir != expdir)
 			metaflag++;
@@ -7436,7 +7393,8 @@ expmeta(char *expdir, char *enddir, char *name)
 		atend = 1;
 	} else {
 		atend = 0;
-		*endname++ = '\0';
+		*endname = '\0';
+		endname += esc + 1;
 	}
 	matchdot = 0;
 	p = start;
@@ -7461,7 +7419,7 @@ expmeta(char *expdir, char *enddir, char *name)
 	}
 	closedir(dirp);
 	if (!atend)
-		endname[-1] = '/';
+		endname[-esc - 1] = esc ? '\\' : '/';
 }
 
 static struct strlist *
@@ -7549,7 +7507,7 @@ expandmeta(struct strlist *str /*, int flag*/)
 		savelastp = exparg.lastp;
 
 		INT_OFF;
-		p = preglob(str->text, 0, RMESCAPE_ALLOC | RMESCAPE_HEAP);
+		p = preglob(str->text, RMESCAPE_ALLOC | RMESCAPE_HEAP);
 		{
 			int i = strlen(str->text);
 			expdir = ckmalloc(i < 2048 ? 2048 : i); /* XXX */
@@ -7639,7 +7597,7 @@ static void
 expandhere(union node *arg, int fd)
 {
 	herefd = fd;
-	expandarg(arg, (struct arglist *)NULL, 0);
+	expandarg(arg, (struct arglist *)NULL, EXP_QUOTED);
 	full_write(fd, stackblock(), expdest - (char *)stackblock());
 }
 
@@ -7649,7 +7607,7 @@ expandhere(union node *arg, int fd)
 static int
 patmatch(char *pattern, const char *string)
 {
-	return pmatch(preglob(pattern, 0, 0), string);
+	return pmatch(preglob(pattern, 0), string);
 }
 
 /*
@@ -7808,6 +7766,15 @@ tryexec(IF_FEATURE_SH_STANDALONE(int applet_no,) char *cmd, char **argv, char **
 	}
 }
 
+#if ENABLE_PLATFORM_MINGW32 && ENABLE_FEATURE_SH_STANDALONE
+/* check if command and executable are both busybox */
+static int busybox_cmd_and_exe(const char *name)
+{
+	return strcmp(name, "busybox") == 0 &&
+		strcmp(bb_basename(bb_busybox_exec_path), "busybox.exe") == 0;
+}
+#endif
+
 /*
  * Exec a program.  Never returns.  If you change this routine, you may
  * have to change the find_command routine as well.
@@ -7838,6 +7805,10 @@ shellexec(char **argv, const char *path, int idx)
 			goto try_PATH;
 		}
 		e = errno;
+#if ENABLE_PLATFORM_MINGW32 && ENABLE_FEATURE_SH_STANDALONE
+	} else if (busybox_cmd_and_exe(argv[0])) {
+		tryexec(-1, bb_busybox_exec_path, argv, envp);
+#endif
 	} else {
  try_PATH:
 		e = ENOENT;
@@ -8337,7 +8308,7 @@ static void *funcblock;         /* block to allocate function from */
 static char *funcstring;        /* block to allocate strings from */
 #if ENABLE_PLATFORM_MINGW32
 static int nodeptrsize;
-static int *nodeptr;
+static char **nodeptr;
 #endif
 
 /* flags in argument to evaltree */
@@ -8499,10 +8470,10 @@ nodeckstrdup(const char *s)
 static union node *copynode(union node *);
 
 #if ENABLE_PLATFORM_MINGW32
-# define SAVE_PTR(dst) {if (nodeptr) *nodeptr++ = (int)&(dst);}
-# define SAVE_PTR2(dst1,dst2) {if (nodeptr) { *nodeptr++ = (int)&(dst1);*nodeptr++ = (int)&(dst2);}}
-# define SAVE_PTR3(dst1,dst2,dst3) {if (nodeptr) { *nodeptr++ = (int)&(dst1);*nodeptr++ = (int)&(dst2);*nodeptr++ = (int)&(dst3);}}
-# define SAVE_PTR4(dst1,dst2,dst3,dst4) {if (nodeptr) { *nodeptr++ = (int)&(dst1);*nodeptr++ = (int)&(dst2);*nodeptr++ = (int)&(dst3);*nodeptr++ = (int)&(dst4);}}
+# define SAVE_PTR(dst) {if (nodeptr) *nodeptr++ = (char *)&(dst);}
+# define SAVE_PTR2(dst1,dst2) {if (nodeptr) { *nodeptr++ = (char *)&(dst1);*nodeptr++ = (char *)&(dst2);}}
+# define SAVE_PTR3(dst1,dst2,dst3) {if (nodeptr) { *nodeptr++ = (char *)&(dst1);*nodeptr++ = (char *)&(dst2);*nodeptr++ = (char *)&(dst3);}}
+# define SAVE_PTR4(dst1,dst2,dst3,dst4) {if (nodeptr) { *nodeptr++ = (char *)&(dst1);*nodeptr++ = (char *)&(dst2);*nodeptr++ = (char *)&(dst3);*nodeptr++ = (char *)&(dst4);}}
 #else
 # define SAVE_PTR(dst)
 # define SAVE_PTR2(dst,dst2)
@@ -8949,7 +8920,7 @@ evalfor(union node *n, int flags)
 	arglist.list = NULL;
 	arglist.lastp = &arglist.list;
 	for (argp = n->nfor.args; argp; argp = argp->narg.next) {
-		expandarg(argp, &arglist, EXP_FULL | EXP_TILDE | EXP_RECORD);
+		expandarg(argp, &arglist, EXP_FULL | EXP_TILDE);
 		/* XXX */
 		if (evalskip)
 			goto out;
@@ -8960,7 +8931,7 @@ evalfor(union node *n, int flags)
 	loopnest++;
 	flags &= EV_TESTED;
 	for (sp = arglist.list; sp; sp = sp->next) {
-		setvar(n->nfor.var, sp->text, 0);
+		setvar0(n->nfor.var, sp->text);
 		evaltree(n->nfor.body, flags);
 		if (evalskip) {
 			if (evalskip == SKIPCONT && --skipcount <= 0) {
@@ -9007,22 +8978,6 @@ evalcase(union node *n, int flags)
 /*
  * Kick off a subshell to evaluate a tree.
  */
-#if ENABLE_PLATFORM_MINGW32
-static void
-forkshell_evalsubshell(struct forkshell *fs)
-{
-	union node *n = fs->n;
-	int flags = fs->flags;
-
-	TRACE(("ash: subshell: %s\n",__PRETTY_FUNCTION__));
-	INT_ON;
-	flags |= EV_EXIT;
-	expredir(n->nredir.redirect);
-	redirect(n->nredir.redirect, 0);
-	evaltreenr(n->nredir.n, flags);
-	/* never returns */
-}
-#endif
 static void
 evalsubshell(union node *n, int flags)
 {
@@ -9038,18 +8993,20 @@ evalsubshell(union node *n, int flags)
 	jp = makejob(/*n,*/ 1);
 #if ENABLE_PLATFORM_MINGW32
 	memset(&fs, 0, sizeof(fs));
-	fs.fp = forkshell_evalsubshell;
+	fs.fpid = FS_EVALSUBSHELL;
 	fs.n = n;
 	fs.flags = flags;
 	if (spawn_forkshell(jp, &fs, backgnd) < 0)
 		ash_msg_and_raise_error("unable to spawn shell");
-#endif
+	if ( 0 ) {
+#else
 	if (forkshell(jp, n, backgnd) == 0) {
 		/* child */
 		INT_ON;
 		flags |= EV_EXIT;
 		if (backgnd)
 			flags &= ~EV_TESTED;
+#endif
  nofork:
 		redirect(n->nredir.redirect, 0);
 		evaltreenr(n->nredir.n, flags);
@@ -9132,31 +9089,6 @@ expredir(union node *n)
  * of the shell, which make the last process in a pipeline the parent
  * of all the rest.)
  */
-#if ENABLE_PLATFORM_MINGW32
-static void
-forkshell_evalpipe(struct forkshell *fs)
-{
-	union node *n = fs->n;
-	int flags = fs->flags;
-	int prevfd = fs->fd[2];
-	int pip[2] = {fs->fd[0], fs->fd[1]};
-
-	TRACE(("ash: subshell: %s\n",__PRETTY_FUNCTION__));
-	INT_ON;
-	if (pip[1] >= 0) {
-		close(pip[0]);
-	}
-	if (prevfd > 0) {
-		dup2(prevfd, 0);
-		close(prevfd);
-	}
-	if (pip[1] > 1) {
-		dup2(pip[1], 1);
-		close(pip[1]);
-	}
-	evaltreenr(n, flags);
-}
-#endif
 static void
 evalpipe(union node *n, int flags)
 {
@@ -9186,7 +9118,7 @@ evalpipe(union node *n, int flags)
 		}
 #if ENABLE_PLATFORM_MINGW32
 		memset(&fs, 0, sizeof(fs));
-		fs.fp = forkshell_evalpipe;
+		fs.fpid = FS_EVALPIPE;
 		fs.flags = flags;
 		fs.n = lp->n;
 		fs.fd[0] = pip[0];
@@ -9194,7 +9126,7 @@ evalpipe(union node *n, int flags)
 		fs.fd[2] = prevfd;
 		if (spawn_forkshell(jp, &fs, n->npipe.pipe_backgnd) < 0)
 			ash_msg_and_raise_error("unable to spawn shell");
-#endif
+#else
 		if (forkshell(jp, lp->n, n->npipe.pipe_backgnd) == 0) {
 			INT_ON;
 			if (pip[1] >= 0) {
@@ -9211,6 +9143,7 @@ evalpipe(union node *n, int flags)
 			evaltreenr(lp->n, flags);
 			/* never returns */
 		}
+#endif
 		if (prevfd >= 0)
 			close(prevfd);
 		prevfd = pip[0];
@@ -9247,8 +9180,8 @@ setinteractive(int on)
 		if (!did_banner) {
 			/* note: ash and hush share this string */
 			out1fmt("\n\n%s %s\n"
-				"Enter 'help' for a list of built-in commands."
-				"\n\n",
+				IF_ASH_HELP("Enter 'help' for a list of built-in commands.\n")
+				"\n",
 				bb_banner,
 				"built-in shell (ash)"
 			);
@@ -9393,7 +9326,8 @@ parse_command_args(char **argv, const char **path)
  * Make a variable a local variable.  When a variable is made local, it's
  * value and flags are saved in a localvar structure.  The saved values
  * will be restored when the shell function returns.  We handle the name
- * "-" as a special case.
+ * "-" as a special case: it makes changes to "set +-options" local
+ * (options will be restored on return from the function).
  */
 static void
 mklocal(char *name)
@@ -9401,21 +9335,37 @@ mklocal(char *name)
 	struct localvar *lvp;
 	struct var **vpp;
 	struct var *vp;
+	char *eq = strchr(name, '=');
 
 	INT_OFF;
-	lvp = ckzalloc(sizeof(struct localvar));
+	/* Cater for duplicate "local". Examples:
+	 * x=0; f() { local x=1; echo $x; local x; echo $x; }; f; echo $x
+	 * x=0; f() { local x=1; echo $x; local x=2; echo $x; }; f; echo $x
+	 */
+	lvp = localvars;
+	while (lvp) {
+		if (lvp->vp && varcmp(lvp->vp->var_text, name) == 0) {
+			if (eq)
+				setvareq(name, 0);
+			/* else:
+			 * it's a duplicate "local VAR" declaration, do nothing
+			 */
+			return;
+		}
+		lvp = lvp->next;
+	}
+
+	lvp = ckzalloc(sizeof(*lvp));
 	if (LONE_DASH(name)) {
 		char *p;
 		p = ckmalloc(sizeof(optlist));
 		lvp->text = memcpy(p, optlist, sizeof(optlist));
 		vp = NULL;
 	} else {
-		char *eq;
-
 		vpp = hashvar(name);
 		vp = *findvar(vpp, name);
-		eq = strchr(name, '=');
 		if (vp == NULL) {
+			/* variable did not exist yet */
 			if (eq)
 				setvareq(name, VSTRFIXED);
 			else
@@ -9425,9 +9375,15 @@ mklocal(char *name)
 		} else {
 			lvp->text = vp->var_text;
 			lvp->flags = vp->flags;
+			/* make sure neither "struct var" nor string gets freed
+			 * during (un)setting:
+			 */
 			vp->flags |= VSTRFIXED|VTEXTFIXED;
 			if (eq)
 				setvareq(name, 0);
+			else
+				/* "local VAR" unsets VAR: */
+				setvar0(name, NULL);
 		}
 	}
 	lvp->vp = vp;
@@ -9498,8 +9454,11 @@ static int exportcmd(int, char **) FAST_FUNC;
 #if ENABLE_ASH_GETOPTS
 static int getoptscmd(int, char **) FAST_FUNC;
 #endif
-#if !ENABLE_FEATURE_SH_EXTRA_QUIET
+#if ENABLE_ASH_HELP
 static int helpcmd(int, char **) FAST_FUNC;
+#endif
+#if MAX_HISTORY
+static int historycmd(int, char **) FAST_FUNC;
 #endif
 #if ENABLE_SH_MATH_SUPPORT
 static int letcmd(int, char **) FAST_FUNC;
@@ -9571,8 +9530,11 @@ static const struct builtincmd builtintab[] = {
 	{ BUILTIN_REGULAR       "getopts" , getoptscmd },
 #endif
 	{ BUILTIN_NOSPEC        "hash"    , hashcmd    },
-#if !ENABLE_FEATURE_SH_EXTRA_QUIET
+#if ENABLE_ASH_HELP
 	{ BUILTIN_NOSPEC        "help"    , helpcmd    },
+#endif
+#if MAX_HISTORY
+	{ BUILTIN_NOSPEC        "history" , historycmd },
 #endif
 #if JOBS
 	{ BUILTIN_REGULAR       "jobs"    , jobscmd    },
@@ -9664,19 +9626,6 @@ bltincmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 	return back_exitstatus;
 }
 
-#if ENABLE_PLATFORM_MINGW32
-static void
-forkshell_shellexec(struct forkshell *fs)
-{
-	int idx = fs->fd[0];
-	struct strlist *varlist = fs->strlist;
-	char **argv = fs->argv;
-	char *path = fs->string;
-
-	listsetvar(varlist, VEXPORT|VSTACK);
-	shellexec(argv, path, idx);
-}
-#endif
 static void
 evalcommand(union node *cmd, int flags)
 {
@@ -9860,7 +9809,7 @@ evalcommand(union node *cmd, int flags)
 			struct forkshell fs;
 
 			memset(&fs, 0, sizeof(fs));
-			fs.fp = forkshell_shellexec;
+			fs.fpid = FS_SHELLEXEC;
 			fs.argv = argv;
 			fs.string = (char*)path;
 			fs.fd[0] = cmdentry.u.index;
@@ -9939,7 +9888,6 @@ evalcommand(union node *cmd, int flags)
 		if (evalfun(cmdentry.u.func, argc, argv, flags))
 			goto raise;
 		break;
-
 	} /* switch */
 
  out:
@@ -9949,7 +9897,7 @@ evalcommand(union node *cmd, int flags)
 		 * '_' in 'vi' command mode during line editing...
 		 * However I implemented that within libedit itself.
 		 */
-		setvar("_", lastarg, 0);
+		setvar0("_", lastarg);
 	}
 	popstackmark(&smark);
 }
@@ -10135,7 +10083,7 @@ preadfd(void)
 #if ENABLE_FEATURE_EDITING
  retry:
 	if (!iflag || g_parsefile->pf_fd != STDIN_FILENO)
-		nr = nonblock_immune_read(g_parsefile->pf_fd, buf, IBUFSIZ - 1, /*loop_on_EINTR:*/ 1);
+		nr = nonblock_immune_read(g_parsefile->pf_fd, buf, IBUFSIZ - 1);
 	else {
 		int timeout = -1;
 # if ENABLE_ASH_IDLE_TIMEOUT
@@ -10151,11 +10099,7 @@ preadfd(void)
 # if ENABLE_FEATURE_TAB_COMPLETION
 		line_input_state->path_lookup = pathval();
 # endif
-		/* Unicode support should be activated even if LANG is set
-		 * _during_ shell execution, not only if it was set when
-		 * shell was started. Therefore, re-check LANG every time:
-		 */
-		reinit_unicode(lookupvar("LANG"));
+		reinit_unicode_for_ash();
 		nr = read_line_input(line_input_state, cmdedit_prompt, buf, IBUFSIZ, timeout);
 		if (nr == 0) {
 			/* Ctrl+C pressed */
@@ -10174,14 +10118,14 @@ preadfd(void)
 			}
 # if ENABLE_ASH_IDLE_TIMEOUT
 			else if (errno == EAGAIN && timeout > 0) {
-				printf("\007timed out waiting for input: auto-logout\n");
+				puts("\007timed out waiting for input: auto-logout");
 				exitshell();
 			}
 # endif
 		}
 	}
 #else
-	nr = nonblock_immune_read(g_parsefile->pf_fd, buf, IBUFSIZ - 1, /*loop_on_EINTR:*/ 1);
+	nr = nonblock_immune_read(g_parsefile->pf_fd, buf, IBUFSIZ - 1);
 #endif
 
 #if 0 /* disabled: nonblock_immune_read() handles this problem */
@@ -10439,6 +10383,7 @@ popallfiles(void)
 		popfile();
 }
 
+#if !ENABLE_PLATFORM_MINGW32
 /*
  * Close the file(s) that the shell is reading commands from.  Called
  * after a fork is done.
@@ -10452,6 +10397,7 @@ closescript(void)
 		g_parsefile->pf_fd = 0;
 	}
 }
+#endif
 
 /*
  * Like setinputfile, but takes an open file descriptor.  Call this with
@@ -10526,10 +10472,8 @@ setinputstring(char *string)
 
 #if ENABLE_ASH_MAIL
 
-#define MAXMBOXES 10
-
-/* times of mailboxes */
-static time_t mailtime[MAXMBOXES];
+/* Hash of mtimes of mailboxes */
+static unsigned mailtime_hash;
 /* Set if MAIL or MAILPATH is changed. */
 static smallint mail_var_path_changed;
 
@@ -10545,13 +10489,14 @@ chkmail(void)
 	const char *mpath;
 	char *p;
 	char *q;
-	time_t *mtp;
+	unsigned new_hash;
 	struct stackmark smark;
 	struct stat statb;
 
 	setstackmark(&smark);
 	mpath = mpathset() ? mpathval() : mailval();
-	for (mtp = mailtime; mtp < mailtime + MAXMBOXES; mtp++) {
+	new_hash = 0;
+	for (;;) {
 		p = path_advance(&mpath, nullstr);
 		if (p == NULL)
 			break;
@@ -10565,16 +10510,15 @@ chkmail(void)
 #endif
 		q[-1] = '\0';                   /* delete trailing '/' */
 		if (stat(p, &statb) < 0) {
-			*mtp = 0;
 			continue;
 		}
-		if (!mail_var_path_changed && statb.st_mtime != *mtp) {
-			fprintf(
-				stderr, "%s\n",
-				pathopt ? pathopt : "you have mail"
-			);
-		}
-		*mtp = statb.st_mtime;
+		/* Very simplistic "hash": just a sum of all mtimes */
+		new_hash += (unsigned)statb.st_mtime;
+	}
+	if (!mail_var_path_changed && mailtime_hash != new_hash) {
+		if (mailtime_hash != 0)
+			out2str("you have mail\n");
+		mailtime_hash = new_hash;
 	}
 	mail_var_path_changed = 0;
 	popstackmark(&smark);
@@ -10846,8 +10790,10 @@ getopts(char *optstr, char *optvar, char **optfirst, int *param_optind, int *opt
 	char c = '?';
 	int done = 0;
 	int err = 0;
-	char s[12];
+	char sbuf[2];
 	char **optnext;
+
+	sbuf[1] = '\0';
 
 	if (*param_optind < 1)
 		return 1;
@@ -10875,9 +10821,9 @@ getopts(char *optstr, char *optvar, char **optfirst, int *param_optind, int *opt
 	for (q = optstr; *q != c;) {
 		if (*q == '\0') {
 			if (optstr[0] == ':') {
-				s[0] = c;
-				s[1] = '\0';
-				err |= setvarsafe("OPTARG", s, 0);
+				sbuf[0] = c;
+				/*sbuf[1] = '\0'; - already is */
+				err |= setvarsafe("OPTARG", sbuf, 0);
 			} else {
 				fprintf(stderr, "Illegal option -%c\n", c);
 				unsetvar("OPTARG");
@@ -10892,9 +10838,9 @@ getopts(char *optstr, char *optvar, char **optfirst, int *param_optind, int *opt
 	if (*++q == ':') {
 		if (*p == '\0' && (p = *optnext) == NULL) {
 			if (optstr[0] == ':') {
-				s[0] = c;
-				s[1] = '\0';
-				err |= setvarsafe("OPTARG", s, 0);
+				sbuf[0] = c;
+				/*sbuf[1] = '\0'; - already is */
+				err |= setvarsafe("OPTARG", sbuf, 0);
 				c = ':';
 			} else {
 				fprintf(stderr, "No arg for -%c option\n", c);
@@ -10913,11 +10859,10 @@ getopts(char *optstr, char *optvar, char **optfirst, int *param_optind, int *opt
  out:
 	*optoff = p ? p - *(optnext - 1) : -1;
 	*param_optind = optnext - optfirst + 1;
-	fmtstr(s, sizeof(s), "%d", *param_optind);
-	err |= setvarsafe("OPTIND", s, VNOFUNC);
-	s[0] = c;
-	s[1] = '\0';
-	err |= setvarsafe(optvar, s, 0);
+	err |= setvarsafe("OPTIND", itoa(*param_optind), VNOFUNC);
+	sbuf[0] = c;
+	/*sbuf[1] = '\0'; - already is */
+	err |= setvarsafe(optvar, sbuf, 0);
 	if (err) {
 		*param_optind = 1;
 		*optoff = -1;
@@ -10970,7 +10915,6 @@ struct heredoc {
 };
 
 static smallint tokpushback;           /* last token pushed back */
-static smallint parsebackquote;        /* nonzero if we are inside backquotes */
 static smallint quoteflag;             /* set if (part of) last token was quoted */
 static token_id_t lasttoken;           /* last token read (integer id Txxx) */
 static struct heredoc *heredoclist;    /* list of here documents to read */
@@ -11015,7 +10959,7 @@ static union node *andor(void);
 static union node *pipeline(void);
 static union node *parse_command(void);
 static void parseheredoc(void);
-static char peektoken(void);
+static char nexttoken_ends_list(void);
 static int readtoken(void);
 
 static union node *
@@ -11025,7 +10969,7 @@ list(int nlflag)
 	int tok;
 
 	checkkwd = CHKNL | CHKKWD | CHKALIAS;
-	if (nlflag == 2 && peektoken())
+	if (nlflag == 2 && nexttoken_ends_list())
 		return NULL;
 	n1 = NULL;
 	for (;;) {
@@ -11067,8 +11011,15 @@ list(int nlflag)
 				tokpushback = 1;
 			}
 			checkkwd = CHKNL | CHKKWD | CHKALIAS;
-			if (peektoken())
+			if (nexttoken_ends_list()) {
+				/* Testcase: "<<EOF; then <W".
+				 * It used to segfault w/o this check:
+				 */
+				if (heredoclist) {
+					raise_error_unexpected_syntax(-1);
+				}
 				return n1;
+			}
 			break;
 		case TEOF:
 			if (heredoclist)
@@ -11623,19 +11574,6 @@ readtoken1(int c, int syntax, char *eofmark, int striptabs)
 
 	IF_ASH_BASH_COMPAT(smallint bash_dollar_squote = 0;)
 
-#if __GNUC__
-	/* Avoid longjmp clobbering */
-	(void) &out;
-	(void) &quotef;
-	(void) &dblquote;
-	(void) &varnest;
-	(void) &arinest;
-	(void) &parenlevel;
-	(void) &dqvarnest;
-	(void) &oldstyle;
-	(void) &prevsyntax;
-	(void) &syntax;
-#endif
 	startlinno = g_parsefile->linno;
 	bqlist = NULL;
 	quotef = 0;
@@ -11705,11 +11643,9 @@ readtoken1(int c, int syntax, char *eofmark, int striptabs)
 				 && c != '$'
 				 && (c != '"' || eofmark != NULL)
 				) {
-					USTPUTC(CTLESC, out);
 					USTPUTC('\\', out);
 				}
-				if (SIT(c, SQSYNTAX) == CCTL)
-					USTPUTC(CTLESC, out);
+				USTPUTC(CTLESC, out);
 				USTPUTC(c, out);
 				quotef = 1;
 			}
@@ -11727,9 +11663,7 @@ readtoken1(int c, int syntax, char *eofmark, int striptabs)
 			goto quotemark;
 		case CENDQUOTE:
 			IF_ASH_BASH_COMPAT(bash_dollar_squote = 0;)
-			if (eofmark != NULL && arinest == 0
-			 && varnest == 0
-			) {
+			if (eofmark != NULL && varnest == 0) {
 				USTPUTC(c, out);
 			} else {
 				if (dqvarnest == 0) {
@@ -11763,10 +11697,9 @@ readtoken1(int c, int syntax, char *eofmark, int striptabs)
 				parenlevel--;
 			} else {
 				if (pgetc() == ')') {
+					c = CTLENDARI;
 					if (--arinest == 0) {
 						syntax = prevsyntax;
-						dblquote = (syntax == DQSYNTAX);
-						c = CTLENDARI;
 					}
 				} else {
 					/*
@@ -11808,7 +11741,7 @@ readtoken1(int c, int syntax, char *eofmark, int striptabs)
 	if (syntax == ARISYNTAX)
 		raise_error_syntax("missing '))'");
 #endif
-	if (syntax != BASESYNTAX && !parsebackquote && eofmark == NULL)
+	if (syntax != BASESYNTAX && eofmark == NULL)
 		raise_error_syntax("unterminated quoted string");
 	if (varnest != 0) {
 		startlinno = g_parsefile->linno;
@@ -12085,12 +12018,10 @@ parsesub: {
  do_pungetc:
 			pungetc();
 		}
-		if (dblquote || arinest)
-			flags |= VSQUOTE;
 		((unsigned char *)stackblock())[typeloc] = subtype | flags;
 		if (subtype != VSNORMAL) {
 			varnest++;
-			if (dblquote || arinest) {
+			if (dblquote) {
 				dqvarnest++;
 			}
 		}
@@ -12106,34 +12037,17 @@ parsesub: {
  */
 parsebackq: {
 	struct nodelist **nlpp;
-	smallint savepbq;
 	union node *n;
-	char *volatile str;
-	struct jmploc jmploc;
-	struct jmploc *volatile savehandler;
+	char *str;
 	size_t savelen;
 	smallint saveprompt = 0;
 
-#ifdef __GNUC__
-	(void) &saveprompt;
-#endif
-	savepbq = parsebackquote;
-	if (setjmp(jmploc.loc)) {
-		free(str);
-		parsebackquote = 0;
-		exception_handler = savehandler;
-		longjmp(exception_handler->loc, 1);
-	}
-	INT_OFF;
 	str = NULL;
 	savelen = out - (char *)stackblock();
 	if (savelen > 0) {
-		str = ckmalloc(savelen);
+		str = alloca(savelen);
 		memcpy(str, stackblock(), savelen);
 	}
-	savehandler = exception_handler;
-	exception_handler = &jmploc;
-	INT_ON;
 	if (oldstyle) {
 		/* We must read until the closing backquote, giving special
 		 * treatment to some slashes, and then push the string and
@@ -12204,7 +12118,6 @@ parsebackq: {
 		nlpp = &(*nlpp)->next;
 	*nlpp = stzalloc(sizeof(**nlpp));
 	/* (*nlpp)->next = NULL; - stzalloc did it */
-	parsebackquote = oldstyle;
 
 	if (oldstyle) {
 		saveprompt = doprompt;
@@ -12233,17 +12146,8 @@ parsebackq: {
 	if (str) {
 		memcpy(out, str, savelen);
 		STADJUST(savelen, out);
-		INT_OFF;
-		free(str);
-		str = NULL;
-		INT_ON;
 	}
-	parsebackquote = savepbq;
-	exception_handler = savehandler;
-	if (arinest || dblquote)
-		USTPUTC(CTLBACKQ | CTLQUOTE, out);
-	else
-		USTPUTC(CTLBACKQ, out);
+	USTPUTC(CTLBACKQ, out);
 	if (oldstyle)
 		goto parsebackq_oldreturn;
 	goto parsebackq_newreturn;
@@ -12257,22 +12161,11 @@ parsearith: {
 	if (++arinest == 1) {
 		prevsyntax = syntax;
 		syntax = ARISYNTAX;
-		USTPUTC(CTLARI, out);
-		if (dblquote)
-			USTPUTC('"', out);
-		else
-			USTPUTC(' ', out);
-	} else {
-		/*
-		 * we collapse embedded arithmetic expansion to
-		 * parenthesis, which should be equivalent
-		 */
-		USTPUTC('(', out);
 	}
+	USTPUTC(CTLARI, out);
 	goto parsearith_return;
 }
 #endif
-
 } /* end of readtoken */
 
 /*
@@ -12505,7 +12398,7 @@ readtoken(void)
 }
 
 static char
-peektoken(void)
+nexttoken_ends_list(void)
 {
 	int t;
 
@@ -12583,7 +12476,7 @@ expandstr(const char *ps)
 	n.narg.text = wordtext;
 	n.narg.backquote = backquotelist;
 
-	expandarg(&n, NULL, 0);
+	expandarg(&n, NULL, EXP_QUOTED);
 	return stackblock();
 }
 #endif
@@ -12665,7 +12558,7 @@ cmdloop(int top)
 		setstackmark(&smark);
 #if JOBS
 		if (doing_jobctl)
-			showjobs(stderr, SHOW_CHANGED);
+			showjobs(SHOW_CHANGED|SHOW_STDERR);
 #endif
 		inter = 0;
 		if (iflag && top) {
@@ -12766,7 +12659,6 @@ dotcmd(int argc, char **argv)
 	 * bash returns exitcode 1 instead.
 	 */
 	fullname = find_dot_file(argv[1]);
-
 	argv += 2;
 	argc -= 2;
 	if (argc) { /* argc > 0, argv[0] != NULL */
@@ -12850,6 +12742,14 @@ find_command(char *name, struct cmdentry *entry, int act, const char *path)
 		entry->cmdtype = CMDNORMAL;
 		return;
 	}
+
+#if ENABLE_PLATFORM_MINGW32 && ENABLE_FEATURE_SH_STANDALONE
+	if (busybox_cmd_and_exe(name)) {
+		entry->u.index = -1;
+		entry->cmdtype = CMDNORMAL;
+		return;
+	}
+#endif
 
 /* #if ENABLE_FEATURE_SH_STANDALONE... moved after builtin check */
 
@@ -12975,7 +12875,7 @@ find_command(char *name, struct cmdentry *entry, int act, const char *path)
 							e = errno;
 						goto loop;
 					}
-					if (!execable_file(fullname)) {
+					if (!file_is_executable(fullname)) {
 						e = ENOEXEC;
 						goto loop;
 					}
@@ -13124,10 +13024,7 @@ trapcmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 
 /* ============ Builtins */
 
-#if !ENABLE_FEATURE_SH_EXTRA_QUIET
-/*
- * Lists available builtins
- */
+#if ENABLE_ASH_HELP
 static int FAST_FUNC
 helpcmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 {
@@ -13145,7 +13042,7 @@ helpcmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 			col = 0;
 		}
 	}
-#if ENABLE_FEATURE_SH_STANDALONE
+# if ENABLE_FEATURE_SH_STANDALONE
 	{
 		const char *a = applet_names;
 		while (*a) {
@@ -13157,11 +13054,20 @@ helpcmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 			a += strlen(a) + 1;
 		}
 	}
-#endif
+# endif
 	out1fmt("\n\n");
 	return EXIT_SUCCESS;
 }
-#endif /* FEATURE_SH_EXTRA_QUIET */
+#endif
+
+#if MAX_HISTORY
+static int FAST_FUNC
+historycmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
+{
+	show_history(line_input_state);
+	return EXIT_SUCCESS;
+}
+#endif
 
 /*
  * The export and readonly commands.
@@ -13264,8 +13170,6 @@ unsetcmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 	return ret & 1;
 }
 
-#if !ENABLE_PLATFORM_MINGW32
-
 static const unsigned char timescmd_str[] ALIGN1 = {
 	' ',  offsetof(struct tms, tms_utime),
 	'\n', offsetof(struct tms, tms_stime),
@@ -13280,7 +13184,7 @@ timescmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 	const unsigned char *p;
 	struct tms buf;
 
-	clk_tck = sysconf(_SC_CLK_TCK);
+	clk_tck = bb_clk_tck();
 	times(&buf);
 
 	p = timescmd_str;
@@ -13297,13 +13201,6 @@ timescmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 
 	return 0;
 }
-#else
-static int FAST_FUNC
-timescmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
-{
-	return 0;
-}
-#endif
 
 #if ENABLE_SH_MATH_SUPPORT
 /*
@@ -13382,7 +13279,7 @@ readcmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 	 * to jump out of it.
 	 */
 	INT_OFF;
-	r = shell_builtin_read(setvar2,
+	r = shell_builtin_read(setvar0,
 		argptr,
 		bltinlookup("IFS"), /* can be NULL */
 		read_flags,
@@ -13400,21 +13297,11 @@ readcmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 }
 
 static int FAST_FUNC
-umaskcmd(int argc UNUSED_PARAM, char **argv)
+umaskcmd(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 {
-	static const char permuser[3] ALIGN1 = "ugo";
-	static const char permmode[3] ALIGN1 = "rwx";
-	static const short permmask[] ALIGN2 = {
-		S_IRUSR, S_IWUSR, S_IXUSR,
-		S_IRGRP, S_IWGRP, S_IXGRP,
-		S_IROTH, S_IWOTH, S_IXOTH
-	};
+	static const char permuser[3] ALIGN1 = "ogu";
 
-	/* TODO: use bb_parse_mode() instead */
-
-	char *ap;
 	mode_t mask;
-	int i;
 	int symbolic_mode = 0;
 
 	while (nextopt("S") != '\0') {
@@ -13426,45 +13313,43 @@ umaskcmd(int argc UNUSED_PARAM, char **argv)
 	umask(mask);
 	INT_ON;
 
-	ap = *argptr;
-	if (ap == NULL) {
+	if (*argptr == NULL) {
 		if (symbolic_mode) {
-			char buf[18];
+			char buf[sizeof(",u=rwx,g=rwx,o=rwx")];
 			char *p = buf;
+			int i;
 
-			for (i = 0; i < 3; i++) {
-				int j;
-
+			i = 2;
+			for (;;) {
+				*p++ = ',';
 				*p++ = permuser[i];
 				*p++ = '=';
-				for (j = 0; j < 3; j++) {
-					if ((mask & permmask[3 * i + j]) == 0) {
-						*p++ = permmode[j];
-					}
-				}
-				*p++ = ',';
+				/* mask is 0..0uuugggooo. i=2 selects uuu bits */
+				if (!(mask & 0400)) *p++ = 'r';
+				if (!(mask & 0200)) *p++ = 'w';
+				if (!(mask & 0100)) *p++ = 'x';
+				mask <<= 3;
+				if (--i < 0)
+					break;
 			}
-			*--p = 0;
-			puts(buf);
+			*p = '\0';
+			puts(buf + 1);
 		} else {
-			out1fmt("%.4o\n", mask);
+			out1fmt("%04o\n", mask);
 		}
 	} else {
-		if (isdigit((unsigned char) *ap)) {
-			mask = 0;
-			do {
-				if (*ap >= '8' || *ap < '0')
-					ash_msg_and_raise_error(msg_illnum, argv[1]);
-				mask = (mask << 3) + (*ap - '0');
-			} while (*++ap != '\0');
-			umask(mask);
-		} else {
-			mask = ~mask & 0777;
-			if (!bb_parse_mode(ap, &mask)) {
-				ash_msg_and_raise_error("illegal mode: %s", ap);
-			}
-			umask(~mask & 0777);
+		char *modestr = *argptr;
+                /* numeric umasks are taken as-is */
+                /* symbolic umasks are inverted: "umask a=rx" calls umask(222) */
+		if (!isdigit(modestr[0]))
+			mask ^= 0777;
+		mask = bb_parse_mode(modestr, mask);
+		if ((unsigned)mask > 0777) {
+			ash_msg_and_raise_error("illegal mode: %s", modestr);
 		}
+		if (!isdigit(modestr[0]))
+			mask ^= 0777;
+		umask(mask);
 	}
 	return 0;
 }
@@ -13517,7 +13402,11 @@ exitshell(void)
 }
 
 static void
+#if ENABLE_PLATFORM_MINGW32
+init(int xp)
+#else
 init(void)
+#endif
 {
 	/* from input.c: */
 	/* we will never free this */
@@ -13566,19 +13455,48 @@ init(void)
 			struct passwd *pw;
 
 			for (envp = environ; envp && *envp; envp++) {
-				end = strchr(*envp, '=');
-				if (!end)
+				if (!(end=strchr(*envp, '=')))
 					continue;
 
 				/* make all variable names uppercase */
 				for (start = *envp;start < end;start++)
 					*start = toupper(*start);
 
+				/* skip conversion of variables known to cause problems */
+				if ( strncmp(*envp, "SYSTEMROOT=", 11) == 0 ||
+						strncmp(*envp, "COMSPEC=", 8) == 0 ) {
+					continue;
+				}
+
 				/* convert backslashes to forward slashes */
-				for ( ++end; *end; ++end ) {
-					if ( *end == '\\' ) {
-						*end = '/';
+				if (!xp) {
+					for ( ++end; *end; ++end ) {
+						if ( *end == '\\' ) {
+							*end = '/';
+						}
 					}
+				}
+
+				/* check for invalid characters */
+				for (start = *envp;start < end;start++) {
+					if (!isdigit(*start) && !isalpha(*start) && *start != '_') {
+						break;
+					}
+				}
+
+				if (start != end) {
+					/*
+					 * Make a copy of the variable, replacing invalid
+					 * characters in the name with underscores.
+					 */
+					char *var = xstrdup(*envp);
+
+					for (start = var;*start != '=';start++) {
+						if (!isdigit(*start) && !isalpha(*start)) {
+							*start = '_';
+						}
+					}
+					setvareq(var, VEXPORT|VNOSAVE);
 				}
 			}
 
@@ -13594,9 +13512,16 @@ init(void)
 			}
 		}
 
-		if (!ENABLE_PLATFORM_MINGW32)
-			setvar("PPID", utoa(getppid()), 0);
-
+		setvar0("PPID", utoa(getppid()));
+#if ENABLE_ASH_BASH_COMPAT
+		p = lookupvar("SHLVL");
+		setvar("SHLVL", utoa((p ? atoi(p) : 0) + 1), VEXPORT);
+		if (!lookupvar("HOSTNAME")) {
+			struct utsname uts;
+			uname(&uts);
+			setvar0("HOSTNAME", uts.nodename);
+		}
+#endif
 		p = lookupvar("PWD");
 		if (p) {
 			if (*p != '/' || stat(p, &st1) || stat(".", &st2)
@@ -13729,20 +13654,6 @@ static short profile_buf[16384];
 extern int etext();
 #endif
 
-#if ENABLE_PLATFORM_MINGW32
-static const forkpoint_fn forkpoints[] = {
-	forkshell_openhere,
-	forkshell_evalbackcmd,
-	forkshell_evalsubshell,
-	forkshell_evalpipe,
-	forkshell_shellexec,
-	NULL
-};
-
-static struct forkshell* forkshell_prepare(struct forkshell *fs);
-static void forkshell_init(const char *idstr);
-#endif
-
 /*
  * Main routine.  We initialize things, parse the arguments, execute
  * profiles if we're a login shell, and then call cmdloop to execute
@@ -13789,7 +13700,7 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
 			exitshell();
 		}
 		if (e == EXINT) {
-			outcslow('\n', stderr);
+			newline_and_flush(stderr);
 		}
 
 		popstackmark(&smark);
@@ -13810,7 +13721,7 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
 #endif
 	rootpid = getpid();
 
-	init();
+	init(IF_PLATFORM_MINGW32(argc >= 2 && strcmp(argv[1], "-X") == 0));
 	setstackmark(&smark);
 
 #if ENABLE_PLATFORM_MINGW32
@@ -13889,7 +13800,7 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
 				hp = lookupvar("HOME");
 				if (hp) {
 					hp = concat_path_file(hp, ".ash_history");
-					setvar("HISTFILE", hp, 0);
+					setvar0("HISTFILE", hp);
 					free((char*)hp);
 					hp = lookupvar("HISTFILE");
 				}
@@ -13920,27 +13831,168 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
 }
 
 #if ENABLE_PLATFORM_MINGW32
+static void
+forkshell_openhere(struct forkshell *fs)
+{
+	union node *redir = fs->n;
+	int pip[2];
+
+	pip[0] = fs->fd[0];
+	pip[1] = fs->fd[1];
+
+	TRACE(("ash: subshell: %s\n",__PRETTY_FUNCTION__));
+
+	close(pip[0]);
+	ignoresig(SIGINT);  //signal(SIGINT, SIG_IGN);
+	ignoresig(SIGQUIT); //signal(SIGQUIT, SIG_IGN);
+	ignoresig(SIGHUP);  //signal(SIGHUP, SIG_IGN);
+	ignoresig(SIGTSTP); //signal(SIGTSTP, SIG_IGN);
+	signal(SIGPIPE, SIG_DFL);
+	if (redir->type == NHERE) {
+		size_t len = strlen(redir->nhere.doc->narg.text);
+		full_write(pip[1], redir->nhere.doc->narg.text, len);
+	} else /* NXHERE */
+		expandhere(redir->nhere.doc, pip[1]);
+	_exit(EXIT_SUCCESS);
+}
+
+static void
+forkshell_evalbackcmd(struct forkshell *fs)
+{
+	union node *n = fs->n;
+	int pip[2] = {fs->fd[0], fs->fd[1]};
+
+	FORCE_INT_ON;
+	close(pip[0]);
+	if (pip[1] != 1) {
+		/*close(1);*/
+		copyfd(pip[1], 1 | COPYFD_EXACT);
+		close(pip[1]);
+	}
+	eflag = 0;
+	evaltree(n, EV_EXIT); /* actually evaltreenr... */
+	/* NOTREACHED */
+}
+
+static void
+forkshell_evalsubshell(struct forkshell *fs)
+{
+	union node *n = fs->n;
+	int flags = fs->flags;
+
+	TRACE(("ash: subshell: %s\n",__PRETTY_FUNCTION__));
+	INT_ON;
+	flags |= EV_EXIT;
+	expredir(n->nredir.redirect);
+	redirect(n->nredir.redirect, 0);
+	evaltreenr(n->nredir.n, flags);
+	/* never returns */
+}
+
+static void
+forkshell_evalpipe(struct forkshell *fs)
+{
+	union node *n = fs->n;
+	int flags = fs->flags;
+	int prevfd = fs->fd[2];
+	int pip[2] = {fs->fd[0], fs->fd[1]};
+
+	TRACE(("ash: subshell: %s\n",__PRETTY_FUNCTION__));
+	INT_ON;
+	if (pip[1] >= 0) {
+		close(pip[0]);
+	}
+	if (prevfd > 0) {
+		dup2(prevfd, 0);
+		close(prevfd);
+	}
+	if (pip[1] > 1) {
+		dup2(pip[1], 1);
+		close(pip[1]);
+	}
+	evaltreenr(n, flags);
+}
+
+static void
+forkshell_shellexec(struct forkshell *fs)
+{
+	int idx = fs->fd[0];
+	struct strlist *varlist = fs->strlist;
+	char **argv = fs->argv;
+	char *path = fs->string;
+
+	listsetvar(varlist, VEXPORT|VSTACK);
+	shellexec(argv, path, idx);
+}
+
+static void
+forkshell_child(struct forkshell *fs)
+{
+	switch ( fs->fpid ) {
+	case FS_OPENHERE:
+		forkshell_openhere(fs);
+		break;
+	case FS_EVALBACKCMD:
+		forkshell_evalbackcmd(fs);
+		break;
+	case FS_EVALSUBSHELL:
+		forkshell_evalsubshell(fs);
+		break;
+	case FS_EVALPIPE:
+		forkshell_evalpipe(fs);
+		break;
+	case FS_SHELLEXEC:
+		forkshell_shellexec(fs);
+		break;
+	}
+}
+
+/*
+ * Reset the pointers to the builtin environment variables in the hash
+ * table to point to varinit rather than the bogus copy created during
+ * forkshell_prepare.
+ */
+static void
+reinitvar(void)
+{
+	struct var *vp;
+	struct var *end;
+	struct var **vpp;
+	struct var **old;
+
+	vp = varinit;
+	end = vp + ARRAY_SIZE(varinit);
+	do {
+		vpp = hashvar(vp->var_text);
+		if ( (old=findvar(vpp, vp->var_text)) != NULL ) {
+			vp->next = (*old)->next;
+			*old = vp;
+		}
+	} while (++vp < end);
+}
+
 /* FIXME: should consider running forkparent() and forkchild() */
 static int
 spawn_forkshell(struct job *jp, struct forkshell *fs, int mode)
 {
-	const char *argv[] = { "sh", "--forkshell", NULL, NULL };
-	char buf[16];
-
 	struct forkshell *new;
+	char buf[16];
+	const char *argv[] = { "sh", "--forkshell", NULL, NULL };
+	pid_t pid;
+
 	new = forkshell_prepare(fs);
 	sprintf(buf, "%x", (unsigned int)new->hMapFile);
 	argv[2] = buf;
-	fs->pid = mingw_spawn_applet(P_NOWAIT, "sh", argv,
+	pid = mingw_spawn_applet(P_NOWAIT, "sh", argv,
 				     (const char *const *)environ);
 	CloseHandle(new->hMapFile);
 	UnmapViewOfFile(new);
-	if (fs->pid == -1) {
+	if (pid == -1) {
 		free(jp);
 		return -1;
 	}
-	forkparent(jp, fs->node, mode, fs->pid);
-	return fs->pid;
+	forkparent(jp, fs->node, mode, pid);
+	return pid;
 }
 
 /*
@@ -14006,22 +14058,6 @@ SLIST_COPY_BEGIN(var_copy,struct var)
  */
 (*vpp)->var_func = NULL;
 SAVE_PTR((*vpp)->var_text);
-SLIST_COPY_END()
-
-/*
- * struct localvar
- */
-SLIST_SIZE_BEGIN(localvar_size,struct localvar)
-var_size(p->vp);
-funcstringsize += strlen(p->text) + 1;
-nodeptrsize += 2; /* p->vp, p->text */
-SLIST_SIZE_END()
-
-SLIST_COPY_BEGIN(localvar_copy,struct localvar)
-(*vpp)->text = nodeckstrdup(vp->text);
-(*vpp)->flags = vp->flags;
-(*vpp)->vp = var_copy(vp->vp);
-SAVE_PTR2((*vpp)->vp, (*vpp)->text);
 SLIST_COPY_END()
 
 /*
@@ -14281,7 +14317,6 @@ forkshell_size(struct forkshell *fs)
 	globals_var_size(fs->gvp);
 	globals_misc_size(fs->gmp);
 	cmdtable_size(fs->cmdtable);
-	localvar_size(fs->localvars);
 	/* optlist_transfer(sending, fd); */
 	/* misc_transfer(sending, fd); */
 
@@ -14290,7 +14325,7 @@ forkshell_size(struct forkshell *fs)
 	funcstringsize += (fs->string ? strlen(fs->string) : 0) + 1;
 	strlist_size(fs->strlist);
 
-	nodeptrsize += 8; /* gvp, gmp, cmdtable, localvars, n, argv, string, strlist */
+	nodeptrsize += 7; /* gvp, gmp, cmdtable, n, argv, string, strlist */
 }
 
 static struct forkshell *
@@ -14305,10 +14340,8 @@ forkshell_copy(struct forkshell *fs)
 	new->gvp = globals_var_copy(fs->gvp);
 	new->gmp = globals_misc_copy(fs->gmp);
 	new->cmdtable = cmdtable_copy(fs->cmdtable);
-	new->localvars = localvar_copy(fs->localvars);
-	SAVE_PTR4(new->gvp, new->gmp, new->cmdtable, new->localvars);
+	SAVE_PTR3(new->gvp, new->gmp, new->cmdtable);
 
-	/* new->fs will be reconstructed from new->fpid */
 	new->n = copynode(fs->n);
 	new->argv = argv_copy(fs->argv);
 	new->string = nodeckstrdup(fs->string);
@@ -14321,28 +14354,20 @@ static struct forkshell *
 forkshell_prepare(struct forkshell *fs)
 {
 	struct forkshell *new;
-	int size, fp, nodeptr_offset;
+	int size, nodeptr_offset;
 	HANDLE h;
 	SECURITY_ATTRIBUTES sa;
-
-	for (fp = 0; forkpoints[fp] && forkpoints[fp] != fs->fp; fp++)
-		;
-
-	if (!forkpoints[fp])
-		bb_error_msg_and_die("invalid forkpoint %08x", (int)fs->fp);
-	fs->fpid = fp;
 
 	/* Calculate size of "new" */
 	fs->gvp = ash_ptr_to_globals_var;
 	fs->gmp = ash_ptr_to_globals_misc;
 	fs->cmdtable = cmdtable;
-	fs->localvars = localvars;
 
 	nodeptrsize = 1;	/* NULL terminated */
 	funcblocksize = 0;
 	funcstringsize = 0;
 	forkshell_size(fs);
-	size = funcblocksize + funcstringsize + nodeptrsize*sizeof(int);
+	size = funcblocksize + funcstringsize + nodeptrsize*sizeof(char *);
 
 	/* Allocate, initialize pointers */
 	memset(&sa, 0, sizeof(sa));
@@ -14354,14 +14379,14 @@ forkshell_prepare(struct forkshell *fs)
 	/* new = ckmalloc(size); */
 	funcblock = new;
 	funcstring = (char *) funcblock + funcblocksize;
-	nodeptr = (int*)((char *) funcstring + funcstringsize);
-	nodeptr_offset = (int) nodeptr - (int) new;
+	nodeptr = (char **)((char *)funcstring + funcstringsize);
+	nodeptr_offset = (char *)nodeptr - (char *)new;
 
 	/* Now pack them all */
 	forkshell_copy(fs);
 
 	/* Finish it up */
-	*nodeptr = 0;
+	*nodeptr = NULL;
 	new->size = size;
 	new->nodeptr_offset = nodeptr_offset;
 	new->old_base = new;
@@ -14382,6 +14407,7 @@ forkshell_init(const char *idstr)
 	struct globals_var **gvpp;
 	struct globals_misc **gmpp;
 	int i;
+	char **ptr;
 
 	if (sscanf(idstr, "%x", &map_handle) != 1)
 		bb_error_msg_and_die("invalid forkshell ID");
@@ -14394,16 +14420,16 @@ forkshell_init(const char *idstr)
 	/* this memory can't be freed */
 	sticky_mem_start = fs;
 	sticky_mem_end = (char *) fs + fs->size;
+
 	/* pointer fixup */
-	nodeptr = (int*)((char*)fs + fs->nodeptr_offset);
-	while (*nodeptr) {
-		int *ptr = (int*)((char*)fs + (*nodeptr - (int)fs->old_base));
+	nodeptr = (char **)((char *)fs + fs->nodeptr_offset);
+	for ( i=0; nodeptr[i]; ++i ) {
+		ptr = (char **)((char *)fs + (nodeptr[i] - (char *)fs->old_base));
 		if (*ptr)
-			*ptr -= ((int)fs->old_base - (int)fs);
-		nodeptr++;
+			*ptr = (char *)fs + (*ptr - (char *)fs->old_base);
 	}
+
 	/* Now fix up stuff that can't be transferred */
-	fs->fp = forkpoints[fs->fpid];
 	for (i = 0; i < ARRAY_SIZE(varinit_data); i++)
 		fs->gvp->varinit[i].var_func = varinit_data[i].var_func;
 	for (i = 0; i < CMDTABLESIZE; i++) {
@@ -14424,10 +14450,13 @@ forkshell_init(const char *idstr)
 	*gvpp = fs->gvp;
 	gmpp = (struct globals_misc **)&ash_ptr_to_globals_misc;
 	*gmpp = fs->gmp;
-	localvars = fs->localvars;
 	cmdtable = fs->cmdtable;
 
-	fs->fp(fs);
+	CLEAR_RANDOM_T(&random_gen); /* or else $RANDOM repeats in child */
+
+	reinitvar();
+
+	forkshell_child(fs);
 }
 
 #undef free

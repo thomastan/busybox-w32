@@ -1,11 +1,20 @@
 #include "libbb.h"
 #include <tlhelp32.h>
 
-int waitpid(pid_t pid, int *status, unsigned options)
+int waitpid(pid_t pid, int *status, int options)
 {
+	HANDLE proc;
+	int ret;
+
 	/* Windows does not understand parent-child */
-	if (options == 0 && pid != -1)
-		return _cwait(status, pid, 0);
+	if (pid > 0 && options == 0) {
+		if ( (proc=OpenProcess(SYNCHRONIZE|PROCESS_QUERY_INFORMATION,
+						FALSE, pid)) != NULL ) {
+			ret = _cwait(status, (intptr_t)proc, 0);
+			CloseHandle(proc);
+			return ret;
+		}
+	}
 	errno = EINVAL;
 	return -1;
 }
@@ -240,7 +249,7 @@ mingw_spawn_interpreter(int mode, const char *prog, const char *const *argv, con
 	else {
 		char *path = xstrdup(getenv("PATH"));
 		char *tmp = path;
-		char *iprog = find_execable(interpr, &tmp);
+		char *iprog = find_executable(interpr, &tmp);
 		free(path);
 		if (!iprog) {
 			free(new_argv);
@@ -275,9 +284,9 @@ mingw_spawn_1(int mode, const char *cmd, const char *const *argv, const char *co
 			return -1;
 		}
 
-		/* exists_execable() does not return new file name */
+		/* executable_exists() does not return new file name */
 		tmp = path = xstrdup(path);
-		prog = find_execable(cmd, &tmp);
+		prog = find_executable(cmd, &tmp);
 		free(path);
 		if (!prog) {
 			errno = ENOENT;
@@ -289,7 +298,7 @@ mingw_spawn_1(int mode, const char *cmd, const char *const *argv, const char *co
 	return ret;
 }
 
-pid_t
+pid_t FAST_FUNC
 mingw_spawn(char **argv)
 {
 	return mingw_spawn_1(P_NOWAIT, argv[0], (const char *const *)argv, (const char *const *)environ);
@@ -334,7 +343,7 @@ mingw_execv(const char *cmd, const char *const *argv)
 }
 
 /* POSIX version in libbb/procps.c */
-procps_status_t* FAST_FUNC procps_scan(procps_status_t* sp, int flags)
+procps_status_t* FAST_FUNC procps_scan(procps_status_t* sp, int flags UNUSED_PARAM)
 {
 	PROCESSENTRY32 pe;
 
@@ -361,7 +370,7 @@ procps_status_t* FAST_FUNC procps_scan(procps_status_t* sp, int flags)
 	}
 
 	sp->pid = pe.th32ProcessID;
-	strncpy(sp->comm, pe.szExeFile, COMM_LEN);
+	safe_strncpy(sp->comm, pe.szExeFile, COMM_LEN);
 	return sp;
 }
 
@@ -369,15 +378,19 @@ int kill(pid_t pid, int sig)
 {
 	HANDLE h;
 
-	if (sig != SIGTERM) {
-		bb_error_msg("kill only supports SIGTERM");
-		errno = EINVAL;
+	if (pid > 0 && sig == SIGTERM) {
+		if ((h=OpenProcess(PROCESS_TERMINATE, FALSE, pid)) != NULL &&
+				TerminateProcess(h, 0)) {
+			CloseHandle(h);
+			return 0;
+		}
+
+		errno = err_win_to_posix(GetLastError());
+		if (h != NULL)
+			CloseHandle(h);
 		return -1;
 	}
-	h = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-	if (h == NULL)
-		return -1;
-	if (TerminateProcess(h, 0) == 0)
-		return -1;
-	return 0;
+
+	errno = EINVAL;
+	return -1;
 }

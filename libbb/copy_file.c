@@ -81,13 +81,11 @@ int FAST_FUNC copy_file(const char *source, const char *dest, int flags)
 	smallint retval = 0;
 	smallint dest_exists = 0;
 	smallint ovr;
-	int status;
 
 /* Inverse of cp -d ("cp without -d") */
 #define FLAGS_DEREF (flags & (FILEUTILS_DEREFERENCE + FILEUTILS_DEREFERENCE_L0))
 
-	status = FLAGS_DEREF ? stat(source, &source_stat) : lstat(source, &source_stat);
-	if (status < 0) {
+	if ((FLAGS_DEREF ? stat : lstat)(source, &source_stat) < 0) {
 		/* This may be a dangling symlink.
 		 * Making [sym]links to dangling symlinks works, so... */
 		if (flags & (FILEUTILS_MAKE_SOFTLINK|FILEUTILS_MAKE_HARDLINK))
@@ -144,7 +142,6 @@ int FAST_FUNC copy_file(const char *source, const char *dest, int flags)
 		}
 
 		/* Did we ever create source ourself before? */
-#if !ENABLE_PLATFORM_MINGW32
 		tp = is_in_ino_dev_hashtable(&source_stat);
 		if (tp) {
 			/* We did! it's a recursion! man the lifeboats... */
@@ -152,7 +149,6 @@ int FAST_FUNC copy_file(const char *source, const char *dest, int flags)
 					source);
 			return -1;
 		}
-#endif
 
 		if (dest_exists) {
 			if (!S_ISDIR(dest_stat.st_mode)) {
@@ -183,11 +179,9 @@ int FAST_FUNC copy_file(const char *source, const char *dest, int flags)
 				return -1;
 			}
 		}
-#if !ENABLE_PLATFORM_MINGW32
 		/* remember (dev,inode) of each created dir.
 		 * NULL: name is not remembered */
 		add_to_ino_dev_hashtable(&dest_stat, NULL);
-#endif
 
 		/* Recursively copy files in SOURCE */
 		dp = opendir(source);
@@ -257,7 +251,6 @@ int FAST_FUNC copy_file(const char *source, const char *dest, int flags)
 			goto dont_cat;
 		}
 
-#if !ENABLE_PLATFORM_MINGW32
 		if (ENABLE_FEATURE_PRESERVE_HARDLINKS && !FLAGS_DEREF) {
 			const char *link_target;
 			link_target = is_in_ino_dev_hashtable(&source_stat);
@@ -275,7 +268,6 @@ int FAST_FUNC copy_file(const char *source, const char *dest, int flags)
 			}
 			add_to_ino_dev_hashtable(&source_stat, dest);
 		}
-#endif
 
 		src_fd = open_or_warn(source, O_RDONLY);
 		if (src_fd < 0)
@@ -398,6 +390,10 @@ int FAST_FUNC copy_file(const char *source, const char *dest, int flags)
 		}
 		if (chmod(dest, source_stat.st_mode) < 0)
 			bb_perror_msg("can't preserve %s of '%s'", "permissions", dest);
+	}
+
+	if (flags & FILEUTILS_VERBOSE) {
+		printf("'%s' -> '%s'\n", source, dest);
 	}
 
 	return retval;

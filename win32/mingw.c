@@ -1,9 +1,30 @@
 #include "libbb.h"
 #include <userenv.h>
 
-unsigned int _CRT_fmode = _O_BINARY;
+#if defined(__MINGW64_VERSION_MAJOR)
+#if ENABLE_GLOBBING
+int _dowildcard = -1;
+#else
+int _dowildcard = 0;
+#endif
 
-static int err_win_to_posix(DWORD winerr)
+#undef _fmode
+int _fmode = _O_BINARY;
+#endif
+
+#if !defined(__MINGW64_VERSION_MAJOR)
+#if ENABLE_GLOBBING
+int _CRT_glob = 1;
+#else
+int _CRT_glob = 0;
+#endif
+
+unsigned int _CRT_fmode = _O_BINARY;
+#endif
+
+smallint bb_got_signal;
+
+int err_win_to_posix(DWORD winerr)
 {
 	int error = ENOSYS;
 	switch(winerr) {
@@ -105,6 +126,7 @@ static int err_win_to_posix(DWORD winerr)
 	case ERROR_SHARING_VIOLATION: error = EACCES; break;
 	case ERROR_STACK_OVERFLOW: error = ENOMEM; break;
 	case ERROR_SWAPERROR: error = ENOENT; break;
+	case ERROR_TOO_MANY_LINKS: error = EMLINK; break;
 	case ERROR_TOO_MANY_MODULES: error = EMFILE; break;
 	case ERROR_TOO_MANY_OPEN_FILES: error = EMFILE; break;
 	case ERROR_UNRECOGNIZED_MEDIA: error = ENXIO; break;
@@ -134,7 +156,7 @@ int mingw_open (const char *filename, int oflags, ...)
 	if (filename && !strcmp(filename, "/dev/null"))
 		filename = "nul";
 	fd = open(filename, oflags, mode);
-	if (fd < 0 && (oflags & O_CREAT) && errno == EACCES) {
+	if (fd < 0 && (oflags & O_ACCMODE) != O_RDONLY && errno == EACCES) {
 		DWORD attrs = GetFileAttributes(filename);
 		if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY))
 			errno = EISDIR;
@@ -177,7 +199,7 @@ static inline int file_attr_to_st_mode (DWORD attr)
 {
 	int fMode = S_IREAD;
 	if (attr & FILE_ATTRIBUTE_DIRECTORY)
-		fMode |= S_IFDIR;
+		fMode |= S_IFDIR|S_IWRITE|S_IEXEC;
 	else
 		fMode |= S_IFREG;
 	if (!(attr & FILE_ATTRIBUTE_READONLY))
@@ -212,17 +234,18 @@ static inline int get_file_attr(const char *fname, WIN32_FILE_ATTRIBUTE_DATA *fd
  * If follow is true then act like stat() and report on the link
  * target. Otherwise report on the link itself.
  */
-static int do_lstat(int follow, const char *file_name, struct stat *buf)
+static int do_lstat(int follow, const char *file_name, struct mingw_stat *buf)
 {
 	int err;
 	WIN32_FILE_ATTRIBUTE_DATA fdata;
+	mode_t usermode;
 
 	if (!(err = get_file_attr(file_name, &fdata))) {
 		int len = strlen(file_name);
 
 		buf->st_ino = 0;
-		buf->st_gid = 0;
-		buf->st_uid = 0;
+		buf->st_uid = DEFAULT_UID;
+		buf->st_gid = DEFAULT_GID;
 		buf->st_nlink = 1;
 		buf->st_mode = file_attr_to_st_mode(fdata.dwFileAttributes);
 		if (len > 4 && (!strcasecmp(file_name+len-4, ".exe") ||
@@ -253,6 +276,15 @@ static int do_lstat(int follow, const char *file_name, struct stat *buf)
 				FindClose(handle);
 			}
 		}
+		usermode = buf->st_mode & S_IRWXU;
+		buf->st_mode |= (usermode >> 3) | ((usermode >> 6) & ~S_IWOTH);
+
+		/*
+		 * Assume a block is 4096 bytes and calculate number of 512 byte
+		 * sectors.
+		 */
+		buf->st_blksize = 4096;
+		buf->st_blocks = ((buf->st_size+4095)>>12)<<3;
 		return 0;
 	}
 	errno = err;
@@ -265,10 +297,10 @@ static int do_lstat(int follow, const char *file_name, struct stat *buf)
  * complete. Note that Git stat()s are redirected to mingw_lstat()
  * too, since Windows doesn't really handle symlinks that well.
  */
-static int do_stat_internal(int follow, const char *file_name, struct stat *buf)
+static int do_stat_internal(int follow, const char *file_name, struct mingw_stat *buf)
 {
 	int namelen;
-	static char alt_name[PATH_MAX];
+	char alt_name[PATH_MAX];
 
 	if (!do_lstat(follow, file_name, buf))
 		return 0;
@@ -292,17 +324,16 @@ static int do_stat_internal(int follow, const char *file_name, struct stat *buf)
 	return do_lstat(follow, alt_name, buf);
 }
 
-int mingw_lstat(const char *file_name, struct stat *buf)
+int mingw_lstat(const char *file_name, struct mingw_stat *buf)
 {
 	return do_stat_internal(0, file_name, buf);
 }
-int mingw_stat(const char *file_name, struct stat *buf)
+int mingw_stat(const char *file_name, struct mingw_stat *buf)
 {
 	return do_stat_internal(1, file_name, buf);
 }
 
-#undef fstat
-int mingw_fstat(int fd, struct stat *buf)
+int mingw_fstat(int fd, struct mingw_stat *buf)
 {
 	HANDLE fh = (HANDLE)_get_osfhandle(fd);
 	BY_HANDLE_FILE_INFORMATION fdata;
@@ -312,13 +343,32 @@ int mingw_fstat(int fd, struct stat *buf)
 		return -1;
 	}
 	/* direct non-file handles to MS's fstat() */
-	if (GetFileType(fh) != FILE_TYPE_DISK)
-		return _fstati64(fd, buf);
+	if (GetFileType(fh) != FILE_TYPE_DISK) {
+		struct _stati64 buf64;
+
+		if ( _fstati64(fd, &buf64) != 0 )  {
+			return -1;
+		}
+		buf->st_dev = 0;
+		buf->st_ino = 0;
+		buf->st_mode = S_IREAD|S_IWRITE;
+		buf->st_nlink = 1;
+		buf->st_uid = DEFAULT_UID;
+		buf->st_gid = DEFAULT_GID;
+		buf->st_rdev = 0;
+		buf->st_size = buf64.st_size;
+		buf->st_atime = buf64.st_atime;
+		buf->st_mtime = buf64.st_mtime;
+		buf->st_ctime = buf64.st_ctime;
+		buf->st_blksize = 4096;
+		buf->st_blocks = ((buf64.st_size+4095)>>12)<<3;
+	}
 
 	if (GetFileInformationByHandle(fh, &fdata)) {
 		buf->st_ino = 0;
-		buf->st_gid = 0;
-		buf->st_uid = 0;
+		buf->st_uid = DEFAULT_UID;
+		buf->st_gid = DEFAULT_GID;
+		/* could use fdata.nNumberOfLinks but it's inconsistent with stat */
 		buf->st_nlink = 1;
 		buf->st_mode = file_attr_to_st_mode(fdata.dwFileAttributes);
 		buf->st_size = fdata.nFileSizeLow |
@@ -327,45 +377,12 @@ int mingw_fstat(int fd, struct stat *buf)
 		buf->st_atime = filetime_to_time_t(&(fdata.ftLastAccessTime));
 		buf->st_mtime = filetime_to_time_t(&(fdata.ftLastWriteTime));
 		buf->st_ctime = filetime_to_time_t(&(fdata.ftCreationTime));
+		buf->st_blksize = 4096;
+		buf->st_blocks = ((buf->st_size+4095)>>12)<<3;
 		return 0;
 	}
 	errno = EBADF;
 	return -1;
-}
-
-static inline void time_t_to_filetime(time_t t, FILETIME *ft)
-{
-	long long winTime = t * 10000000LL + 116444736000000000LL;
-	ft->dwLowDateTime = winTime;
-	ft->dwHighDateTime = winTime >> 32;
-}
-
-int mingw_utime (const char *file_name, const struct utimbuf *times)
-{
-	FILETIME mft, aft;
-	int fh, rc;
-
-	/* must have write permission */
-	if ((fh = open(file_name, O_RDWR | O_BINARY)) < 0)
-		return -1;
-
-	if (times) {
-		time_t_to_filetime(times->modtime, &mft);
-		time_t_to_filetime(times->actime, &aft);
-	}
-	else {
-		SYSTEMTIME st;
-		GetSystemTime(&st);
-		SystemTimeToFileTime(&st, &aft);
-		mft = aft;
-	}
-	if (!SetFileTime((HANDLE)_get_osfhandle(fh), NULL, &aft, &mft)) {
-		errno = EINVAL;
-		rc = -1;
-	} else
-		rc = 0;
-	close(fh);
-	return rc;
 }
 
 static inline void timeval_to_filetime(const struct timeval tv, FILETIME *ft)
@@ -375,31 +392,58 @@ static inline void timeval_to_filetime(const struct timeval tv, FILETIME *ft)
 	ft->dwHighDateTime = winTime >> 32;
 }
 
-int utimes(const char *file_name, const struct timeval times[2])
+int utimes(const char *file_name, const struct timeval tims[2])
 {
 	FILETIME mft, aft;
-	int fh, rc;
+	HANDLE fh;
+	DWORD flags, attrs;
+	int rc;
+
+	flags = FILE_ATTRIBUTE_NORMAL;
 
 	/* must have write permission */
-	if ((fh = open(file_name, O_RDWR | O_BINARY)) < 0)
-		return -1;
+	attrs = GetFileAttributes(file_name);
+	if ( attrs != INVALID_FILE_ATTRIBUTES ) {
+	    if ( attrs & FILE_ATTRIBUTE_READONLY ) {
+			/* ignore errors here; open() will report them */
+			SetFileAttributes(file_name, attrs & ~FILE_ATTRIBUTE_READONLY);
+		}
 
-	if (times) {
-		timeval_to_filetime(times[0], &aft);
-		timeval_to_filetime(times[1], &mft);
+	    if ( attrs & FILE_ATTRIBUTE_DIRECTORY ) {
+			flags = FILE_FLAG_BACKUP_SEMANTICS;
+		}
+	}
+
+	fh = CreateFile(file_name, GENERIC_READ|GENERIC_WRITE,
+				FILE_SHARE_READ|FILE_SHARE_WRITE,
+				NULL, OPEN_EXISTING, flags, NULL);
+	if ( fh == INVALID_HANDLE_VALUE ) {
+		errno = err_win_to_posix(GetLastError());
+		rc = -1;
+		goto revert_attrs;
+	}
+
+	if (tims) {
+		timeval_to_filetime(tims[0], &aft);
+		timeval_to_filetime(tims[1], &mft);
 	}
 	else {
-		SYSTEMTIME st;
-		GetSystemTime(&st);
-		SystemTimeToFileTime(&st, &aft);
-		mft = aft;
+		GetSystemTimeAsFileTime(&mft);
+		aft = mft;
 	}
-	if (!SetFileTime((HANDLE)_get_osfhandle(fh), NULL, &aft, &mft)) {
+	if (!SetFileTime(fh, NULL, &aft, &mft)) {
 		errno = EINVAL;
 		rc = -1;
 	} else
 		rc = 0;
-	close(fh);
+	CloseHandle(fh);
+
+revert_attrs:
+	if (attrs != INVALID_FILE_ATTRIBUTES &&
+	    (attrs & FILE_ATTRIBUTE_READONLY)) {
+		/* ignore errors again */
+		SetFileAttributes(file_name, attrs);
+	}
 	return rc;
 }
 
@@ -407,6 +451,20 @@ unsigned int sleep (unsigned int seconds)
 {
 	Sleep(seconds*1000);
 	return 0;
+}
+
+/*
+ * Windows' mktemp returns NULL on error whereas POSIX always returns the
+ * template and signals an error by making it an empty string.
+ */
+#undef mktemp
+char *mingw_mktemp(char *template)
+{
+	if ( mktemp(template) == NULL ) {
+		template[0] = '\0';
+	}
+
+	return template;
 }
 
 int mkstemp(char *template)
@@ -524,147 +582,131 @@ static char *gethomedir(void)
 	return buf;
 }
 
-struct passwd *getpwuid(int uid UNUSED_PARAM)
+static char *get_user_name(void)
 {
-	static char user_name[100];
-	static struct passwd p;
+	static char user_name[100] = "";
+	char *s;
 	DWORD len = sizeof(user_name);
 
-	user_name[0] = '\0';
-	if (!GetUserName(user_name, &len))
+	if ( user_name[0] != '\0' ) {
+		return user_name;
+	}
+
+	if ( !GetUserName(user_name, &len) ) {
 		return NULL;
-	p.pw_name = user_name;
-	p.pw_gecos = "unknown";
+	}
+
+	for ( s=user_name; *s; ++s ) {
+		if ( *s == ' ' ) {
+			*s = '_';
+		}
+	}
+
+	return user_name;
+}
+
+struct passwd *getpwnam(const char *name)
+{
+	const char *myname;
+
+	if ( (myname=get_user_name()) != NULL &&
+			strcmp(myname, name) == 0 ) {
+		return getpwuid(DEFAULT_UID);
+	}
+
+	return NULL;
+}
+
+struct passwd *getpwuid(uid_t uid UNUSED_PARAM)
+{
+	static struct passwd p;
+
+	if ( (p.pw_name=get_user_name()) == NULL ) {
+		return NULL;
+	}
+	p.pw_passwd = (char *)"secret";
+	p.pw_gecos = (char *)"unknown";
 	p.pw_dir = gethomedir();
 	p.pw_shell = NULL;
-	p.pw_uid = 1000;
-	p.pw_gid = 1000;
+	p.pw_uid = DEFAULT_UID;
+	p.pw_gid = DEFAULT_GID;
 
 	return &p;
 }
 
-static HANDLE timer_event;
-static HANDLE timer_thread;
-static int timer_interval;
-static int one_shot;
-static sighandler_t timer_fn = SIG_DFL;
-
-/* The timer works like this:
- * The thread, ticktack(), is a trivial routine that most of the time
- * only waits to receive the signal to terminate. The main thread tells
- * the thread to terminate by setting the timer_event to the signalled
- * state.
- * But ticktack() interrupts the wait state after the timer's interval
- * length to call the signal handler.
- */
-
-static __stdcall unsigned ticktack(void *dummy UNUSED_PARAM)
+struct group *getgrgid(gid_t gid UNUSED_PARAM)
 {
-	while (WaitForSingleObject(timer_event, timer_interval) == WAIT_TIMEOUT) {
-		if (timer_fn == SIG_DFL)
-			bb_error_msg_and_die("Alarm");
-		if (timer_fn != SIG_IGN)
-			timer_fn(SIGALRM);
-		if (one_shot)
-			break;
+	static char *members[2] = { NULL, NULL };
+	static struct group g;
+
+	if ( (g.gr_name=get_user_name()) == NULL ) {
+		return NULL;
 	}
+	g.gr_passwd = (char *)"secret";
+	g.gr_gid = DEFAULT_GID;
+	members[0] = g.gr_name;
+	g.gr_mem = members;
+
+	return &g;
+}
+
+int getgrouplist(const char *user UNUSED_PARAM, gid_t group UNUSED_PARAM,
+					gid_t *groups, int *ngroups)
+{
+	if ( *ngroups == 0 ) {
+		*ngroups = 1;
+		return -1;
+	}
+
+	*ngroups = 1;
+	groups[0] = DEFAULT_GID;
+	return 1;
+}
+
+int getgroups(int n, gid_t *groups)
+{
+	if ( n == 0 ) {
+		return 1;
+	}
+
+	groups[0] = DEFAULT_GID;
+	return 1;
+}
+
+int getlogin_r(char *buf, size_t len)
+{
+	char *name;
+
+	if ( (name=get_user_name()) == NULL ) {
+		return -1;
+	}
+
+	if ( strlen(name) >= len ) {
+		errno = ERANGE;
+		return -1;
+	}
+
+	strcpy(buf, name);
 	return 0;
 }
 
-static int start_timer_thread(void)
+long sysconf(int name)
 {
-	timer_event = CreateEvent(NULL, FALSE, FALSE, NULL);
-	if (timer_event) {
-		timer_thread = (HANDLE) _beginthreadex(NULL, 0, ticktack, NULL, 0, NULL);
-		if (!timer_thread ) {
-			errno = ENOMEM;
-			return -1;
-		}
-	} else {
-		errno = ENOMEM;
-		return -1;
+	if ( name == _SC_CLK_TCK ) {
+		return 100;
 	}
+	errno = EINVAL;
+	return -1;
+}
+
+clock_t times(struct tms *buf)
+{
+	buf->tms_utime = 0;
+	buf->tms_stime = 0;
+	buf->tms_cutime = 0;
+	buf->tms_cstime = 0;
+
 	return 0;
-}
-
-static void stop_timer_thread(void)
-{
-	if (timer_event)
-		SetEvent(timer_event);	/* tell thread to terminate */
-	if (timer_thread) {
-		int rc = WaitForSingleObject(timer_thread, 1000);
-		if (rc == WAIT_TIMEOUT)
-			fprintf(stderr, "timer thread did not terminate timely");
-		else if (rc != WAIT_OBJECT_0)
-			fprintf(stderr, "waiting for timer thread failed: %lu",
-			      GetLastError());
-		CloseHandle(timer_thread);
-	}
-	if (timer_event)
-		CloseHandle(timer_event);
-	timer_event = NULL;
-	timer_thread = NULL;
-}
-
-static inline int is_timeval_eq(const struct timeval *i1, const struct timeval *i2)
-{
-	return i1->tv_sec == i2->tv_sec && i1->tv_usec == i2->tv_usec;
-}
-
-int setitimer(int type UNUSED_PARAM, struct itimerval *in, struct itimerval *out)
-{
-	static const struct timeval zero;
-	static int atexit_done;
-
-	if (out != NULL) {
-		errno = EINVAL;
-		return -1;
-	}
-	if (!is_timeval_eq(&in->it_interval, &zero) &&
-	    !is_timeval_eq(&in->it_interval, &in->it_value)) {
-		errno = EINVAL;
-		return -1;
-	}
-
-	if (timer_thread)
-		stop_timer_thread();
-
-	if (is_timeval_eq(&in->it_value, &zero) &&
-	    is_timeval_eq(&in->it_interval, &zero))
-		return 0;
-
-	timer_interval = in->it_value.tv_sec * 1000 + in->it_value.tv_usec / 1000;
-	one_shot = is_timeval_eq(&in->it_interval, &zero);
-	if (!atexit_done) {
-		atexit(stop_timer_thread);
-		atexit_done = 1;
-	}
-	return start_timer_thread();
-}
-
-int sigaction(int sig, struct sigaction *in, struct sigaction *out)
-{
-	if (sig != SIGALRM) {
-		errno = EINVAL;
-		return -1;
-	}
-	if (out != NULL) {
-		errno = EINVAL;
-		return -1;
-	}
-
-	timer_fn = in->sa_handler;
-	return 0;
-}
-
-#undef signal
-sighandler_t mingw_signal(int sig, sighandler_t handler)
-{
-	sighandler_t old = timer_fn;
-	if (sig != SIGALRM)
-		return signal(sig, handler);
-	timer_fn = handler;
-	return old;
 }
 
 int link(const char *oldpath, const char *newpath)
@@ -706,7 +748,33 @@ const char *get_busybox_exec_path(void)
 #undef mkdir
 int mingw_mkdir(const char *path, int mode UNUSED_PARAM)
 {
-	return mkdir(path);
+	int ret;
+	struct stat st;
+	int lerrno = 0;
+
+	if ( (ret=mkdir(path)) < 0 ) {
+		lerrno = errno;
+		if ( lerrno == EACCES && stat(path, &st) == 0 ) {
+			ret = 0;
+			lerrno = 0;
+		}
+	}
+
+	errno = lerrno;
+	return ret;
+}
+
+#undef chmod
+int mingw_chmod(const char *path, int mode)
+{
+	WIN32_FILE_ATTRIBUTE_DATA fdata;
+
+	if ( get_file_attr(path, &fdata) == 0 &&
+			fdata.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY ) {
+		mode |= 0222;
+	}
+
+	return chmod(path, mode);
 }
 
 int fcntl(int fd, int cmd, ...)
@@ -742,6 +810,7 @@ int fcntl(int fd, int cmd, ...)
 		}
 		free(fds);
 		result = newfd;
+		break;
 	default:
 		errno = ENOSYS;
 		break;
@@ -759,9 +828,85 @@ int mingw_unlink(const char *pathname)
 	return unlink(pathname);
 }
 
-char *strptime(const char *s UNUSED_PARAM, const char *format UNUSED_PARAM, struct tm *tm UNUSED_PARAM)
+#undef strftime
+size_t mingw_strftime(char *buf, size_t max, const char *format, const struct tm *tm)
 {
-	return NULL;
+	size_t ret;
+	char day[3];
+	char *t;
+	char *fmt, *newfmt;
+	struct tm tm2;
+	int m;
+
+	/*
+	 * Emulate the '%e' and '%s' formats that Windows' strftime lacks.
+	 * Happily, the string that replaces '%e' is two characters long.
+	 * '%s' is a bit more complicated.
+	 */
+	fmt = xstrdup(format);
+	for ( t=fmt; *t; ++t ) {
+		if ( *t == '%' ) {
+			if ( t[1] == 'e' ) {
+				if ( tm->tm_mday >= 0 && tm->tm_mday <= 99 ) {
+					sprintf(day, "%2d", tm->tm_mday);
+				}
+				else {
+					strcpy(day, "  ");
+				}
+				memcpy(t++, day, 2);
+			}
+			else if ( t[1] == 's' ) {
+				*t = '\0';
+				m = t - fmt;
+				tm2 = *tm;
+				newfmt = xasprintf("%s%d%s", fmt, (int)mktime(&tm2), t+2);
+				free(fmt);
+				t = newfmt + m + 1;
+				fmt = newfmt;
+			}
+			else if ( t[1] == 'z' ) {
+				char buffer[16] = "";
+
+				*t = '\0';
+				m = t - fmt;
+				_tzset();
+				if ( tm->tm_isdst >= 0 ) {
+					int offset = (int)_timezone - (tm->tm_isdst > 0 ? 3600 : 0);
+					int hr, min;
+
+					if ( offset > 0 ) {
+						buffer[0] = '-';
+					}
+					else {
+						buffer[0] = '+';
+						offset = -offset;
+					}
+
+					hr = offset / 3600;
+					min = (offset % 3600) / 60;
+					sprintf(buffer+1, "%02d%02d", hr, min);
+				}
+				newfmt = xasprintf("%s%s%s", fmt, buffer, t+2);
+				free(fmt);
+				t = newfmt + m + 1;
+				fmt = newfmt;
+			}
+			else if ( t[1] != '\0' ) {
+				++t;
+			}
+		}
+	}
+
+	ret = strftime(buf, max, fmt, tm);
+	free(fmt);
+
+	return ret;
+}
+
+int stime(time_t *t UNUSED_PARAM)
+{
+	errno = EPERM;
+	return -1;
 }
 
 #undef access
@@ -831,13 +976,21 @@ int mingw_access(const char *name, int mode)
 	return -1;
 }
 
+#undef rmdir
+int mingw_rmdir(const char *path)
+{
+	/* read-only directories cannot be removed */
+	chmod(path, 0666);
+	return rmdir(path);
+}
+
 /* check if path can be made into an executable by adding a suffix;
  * return an allocated string containing the path if it can;
  * return NULL if not.
  *
  * if path already has a suffix don't even bother trying
  */
-char *win32_execable_file(const char *p)
+char *file_is_win32_executable(const char *p)
 {
 	char *path;
 	int len = strlen(p);
@@ -850,15 +1003,30 @@ char *win32_execable_file(const char *p)
 	if ( (path=malloc(len+5)) != NULL ) {
 		memcpy(path, p, len);
 		memcpy(path+len, ".exe", 5);
-		if (execable_file(path)) {
+		if (file_is_executable(path)) {
 			return path;
 		}
 		memcpy(path+len, ".com", 5);
-		if (execable_file(path)) {
+		if (file_is_executable(path)) {
 			return path;
 		}
 		free(path);
 	}
 
 	return NULL;
+}
+
+#undef opendir
+DIR *mingw_opendir(const char *path)
+{
+	char name[4];
+
+	if (isalpha(path[0]) && path[1] == ':' && path[2] == '\0') {
+		strcpy(name, path);
+		name[2] = '/';
+		name[3] = '\0';
+		path = name;
+	}
+
+	return opendir(path);
 }

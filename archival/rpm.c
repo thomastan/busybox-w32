@@ -7,6 +7,15 @@
  * Licensed under GPLv2 or later, see file LICENSE in this source tree.
  */
 
+//config:config RPM
+//config:	bool "rpm"
+//config:	default y
+//config:	help
+//config:	  Mini RPM applet - queries and extracts RPM packages.
+
+//applet:IF_RPM(APPLET(rpm, BB_DIR_BIN, BB_SUID_DROP))
+//kbuild:lib-$(CONFIG_RPM) += rpm.o
+
 //usage:#define rpm_trivial_usage
 //usage:       "-i PACKAGE.rpm; rpm -qp[ildc] PACKAGE.rpm"
 //usage:#define rpm_full_usage "\n\n"
@@ -113,7 +122,7 @@ static void extract_cpio(int fd, const char *source_rpm)
 	archive_handle->src_fd = fd;
 	/*archive_handle->offset = 0; - init_handle() did it */
 
-	setup_unzip_on_fd(archive_handle->src_fd, /*fail_if_not_detected:*/ 1);
+	setup_unzip_on_fd(archive_handle->src_fd, /*fail_if_not_compressed:*/ 1);
 	while (get_header_cpio(archive_handle) == EXIT_SUCCESS)
 		continue;
 }

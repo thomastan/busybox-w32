@@ -240,6 +240,7 @@ static unsigned get_kernel_HZ(void)
 
 /* Print value to buf, max size+1 chars (including trailing '\0') */
 
+#if !ENABLE_PLATFORM_MINGW32
 static void func_user(char *buf, int size, const procps_status_t *ps)
 {
 #if 1
@@ -263,12 +264,14 @@ static void func_group(char *buf, int size, const procps_status_t *ps)
 {
 	safe_strncpy(buf, get_cached_groupname(ps->gid), size+1);
 }
+#endif
 
 static void func_comm(char *buf, int size, const procps_status_t *ps)
 {
 	safe_strncpy(buf, ps->comm, size+1);
 }
 
+#if !ENABLE_PLATFORM_MINGW32
 static void func_state(char *buf, int size, const procps_status_t *ps)
 {
 	safe_strncpy(buf, ps->state, size+1);
@@ -278,12 +281,14 @@ static void func_args(char *buf, int size, const procps_status_t *ps)
 {
 	read_cmdline(buf, size+1, ps->pid, ps->comm);
 }
+#endif
 
 static void func_pid(char *buf, int size, const procps_status_t *ps)
 {
 	sprintf(buf, "%*u", size, ps->pid);
 }
 
+#if !ENABLE_PLATFORM_MINGW32
 static void func_ppid(char *buf, int size, const procps_status_t *ps)
 {
 	sprintf(buf, "%*u", size, ps->ppid);
@@ -299,8 +304,7 @@ static void put_lu(char *buf, int size, unsigned long u)
 	char buf4[5];
 
 	/* see http://en.wikipedia.org/wiki/Tera */
-	smart_ulltoa4(u, buf4, " mgtpezy");
-	buf4[4] = '\0';
+	smart_ulltoa4(u, buf4, " mgtpezy")[0] = '\0';
 	sprintf(buf, "%.*s", size, buf4);
 }
 
@@ -321,6 +325,7 @@ static void func_tty(char *buf, int size, const procps_status_t *ps)
 	if (ps->tty_major) /* tty field of "0" means "no tty" */
 		snprintf(buf, size+1, "%u,%u", ps->tty_major, ps->tty_minor);
 }
+#endif
 
 #if ENABLE_FEATURE_PS_ADDITIONAL_COLUMNS
 
@@ -665,8 +670,8 @@ int ps_main(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 		OPT_l = (1 << ENABLE_SELINUX) * (1 << ENABLE_FEATURE_SHOW_THREADS) * ENABLE_FEATURE_PS_LONG,
 	};
 #if ENABLE_FEATURE_PS_LONG
-	time_t now = now;
-	unsigned long uptime;
+	time_t now = now; /* for compiler */
+	unsigned long uptime = uptime;
 #endif
 	/* If we support any options, parse argv */
 #if ENABLE_SELINUX || ENABLE_FEATURE_SHOW_THREADS || ENABLE_FEATURE_PS_WIDE || ENABLE_FEATURE_PS_LONG
@@ -750,8 +755,7 @@ int ps_main(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 #endif
 		{
 			char buf6[6];
-			smart_ulltoa5(p->vsz, buf6, " mgtpezy");
-			buf6[5] = '\0';
+			smart_ulltoa5(p->vsz, buf6, " mgtpezy")[0] = '\0';
 #if ENABLE_FEATURE_PS_LONG
 			if (opts & OPT_l) {
 				char bufr[6], stime_str[6];
@@ -762,8 +766,7 @@ int ps_main(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 				time_t start = now - elapsed;
 				struct tm *tm = localtime(&start);
 
-				smart_ulltoa5(p->rss, bufr, " mgtpezy");
-				bufr[5] = '\0';
+				smart_ulltoa5(p->rss, bufr, " mgtpezy")[0] = '\0';
 
 				if (p->tty_major == 136)
 					/* It should be pts/N, not ptsN, but N > 9
@@ -799,9 +802,11 @@ int ps_main(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 
 		{
 			int sz = terminal_width - len;
-			char buf[sz + 1];
-			read_cmdline(buf, sz, p->pid, p->comm);
-			puts(buf);
+			if (sz >= 0) {
+				char buf[sz + 1];
+				read_cmdline(buf, sz, p->pid, p->comm);
+				puts(buf);
+			}
 		}
 	}
 	if (ENABLE_FEATURE_CLEAN_UP)

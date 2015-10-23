@@ -38,8 +38,17 @@
  * and the \] escape to signal the end of such a sequence. Example:
  *
  * PS1='\[\033[01;32m\]\u@\h\[\033[01;34m\] \w \$\[\033[00m\] '
+ *
+ * Unicode in PS1 is not fully supported: prompt length calulation is wrong,
+ * resulting in line wrap problems with long (multi-line) input.
+ *
+ * Multi-line PS1 (e.g. PS1="\n[\w]\n$ ") has problems with history
+ * browsing: up/down arrows result in scrolling.
+ * It stems from simplistic "cmdedit_y = cmdedit_prmt_len / cmdedit_termw"
+ * calculation of how many lines the prompt takes.
  */
-#include "libbb.h"
+#include "busybox.h"
+#include "NUM_APPLETS.h"
 #include "unicode.h"
 #ifndef _POSIX_VDISABLE
 # define _POSIX_VDISABLE '\0'
@@ -401,6 +410,42 @@ static void put_cur_glyph_and_inc_cursor(void)
 	}
 }
 
+#if ENABLE_PLATFORM_MINGW32
+static void inc_cursor(void)
+{
+	CHAR_T c = command_ps[cursor];
+	unsigned width = 0;
+	int ofs_to_right;
+
+	/* advance cursor */
+	cursor++;
+	if (unicode_status == UNICODE_ON) {
+		IF_UNICODE_WIDE_WCHARS(width = cmdedit_x;)
+		c = adjust_width_and_validate_wc(&cmdedit_x, c);
+		IF_UNICODE_WIDE_WCHARS(width = cmdedit_x - width;)
+	} else {
+		cmdedit_x++;
+	}
+
+	ofs_to_right = cmdedit_x - cmdedit_termw;
+	if (!ENABLE_UNICODE_WIDE_WCHARS || ofs_to_right <= 0) {
+		/* cursor remains on this line */
+		printf(ESC"[1C");
+	}
+
+	if (ofs_to_right >= 0) {
+		/* we go to the next line */
+		printf(ESC"[1B");
+		bb_putchar('\r');
+		cmdedit_y++;
+		if (!ENABLE_UNICODE_WIDE_WCHARS || ofs_to_right == 0) {
+			width = 0;
+		}
+		cmdedit_x = width;
+	}
+}
+#endif
+
 /* Move to end of line (by printing all chars till the end) */
 static void put_till_end_and_adv_cursor(void)
 {
@@ -457,6 +502,7 @@ static void input_backward(unsigned num)
 
 	if (cmdedit_x >= num) {
 		cmdedit_x -= num;
+#if !ENABLE_PLATFORM_MINGW32
 		if (num <= 4) {
 			/* This is longer by 5 bytes on x86.
 			 * Also gets miscompiled for ARM users
@@ -469,6 +515,7 @@ static void input_backward(unsigned num)
 			} while (--num);
 			return;
 		}
+#endif
 		printf(ESC"[%uD", num);
 		return;
 	}
@@ -600,7 +647,11 @@ static void input_backspace(void)
 static void input_forward(void)
 {
 	if (cursor < command_len)
+#if !ENABLE_PLATFORM_MINGW32
 		put_cur_glyph_and_inc_cursor();
+#else
+		inc_cursor();
+#endif
 }
 
 #if ENABLE_FEATURE_TAB_COMPLETION
@@ -643,7 +694,6 @@ static char *username_path_completion(char *ud)
 	if (*ud == '/') {       /* "~/..." */
 		home = home_pwd_buf;
 	} else {
-#if !ENABLE_PLATFORM_MINGW32
 		/* "~user/..." */
 		ud = strchr(ud, '/');
 		*ud = '\0';           /* "~user" */
@@ -651,7 +701,6 @@ static char *username_path_completion(char *ud)
 		*ud = '/';            /* restore "~user/..." */
 		if (entry)
 			home = entry->pw_dir;
-#endif
 	}
 	if (home) {
 		ud = concat_path_file(home, ud);
@@ -666,27 +715,20 @@ static char *username_path_completion(char *ud)
  */
 static NOINLINE unsigned complete_username(const char *ud)
 {
-#if !ENABLE_PLATFORM_MINGW32
-	/* Using _r function to avoid pulling in static buffers */
-	char line_buff[256];
-	struct passwd pwd;
-	struct passwd *result;
-#endif
+	struct passwd *pw;
 	unsigned userlen;
 
 	ud++; /* skip ~ */
 	userlen = strlen(ud);
 
-#if !ENABLE_PLATFORM_MINGW32
 	setpwent();
-	while (!getpwent_r(&pwd, line_buff, sizeof(line_buff), &result)) {
+	while ((pw = getpwent()) != NULL) {
 		/* Null usernames should result in all users as possible completions. */
-		if (/*!userlen || */ strncmp(ud, pwd.pw_name, userlen) == 0) {
-			add_match(xasprintf("~%s/", pwd.pw_name));
+		if (/* !ud[0] || */ is_prefixed_with(pw->pw_name, ud)) {
+			add_match(xasprintf("~%s/", pw->pw_name));
 		}
 	}
-	endpwent();
-#endif
+	endpwent(); /* don't keep password file open */
 
 	return 1 + userlen;
 }
@@ -718,7 +760,7 @@ static int path_parse(char ***p)
 	npth = 1; /* path component count */
 	while (1) {
 #if ENABLE_PLATFORM_MINGW32
-		tmp = next_path_sep(tmp);
+		tmp = (char *)next_path_sep(tmp);
 #else
 		tmp = strchr(tmp, ':');
 #endif
@@ -735,7 +777,7 @@ static int path_parse(char ***p)
 	npth = 1;
 	while (1) {
 #if ENABLE_PLATFORM_MINGW32
-		tmp = next_path_sep(tmp);
+		tmp = (char *)next_path_sep(tmp);
 #else
 		tmp = strchr(tmp, ':');
 #endif
@@ -783,6 +825,18 @@ static NOINLINE unsigned complete_cmd_dir_file(const char *command, int type)
 	}
 	pf_len = strlen(pfind);
 
+#if ENABLE_FEATURE_SH_STANDALONE && NUM_APPLETS != 1
+	if (type == FIND_EXE_ONLY) {
+		const char *p = applet_names;
+
+		for (i=0; i < NUM_APPLETS; i++) {
+			if (strncmp(pfind, p, pf_len) == 0)
+				add_match(xstrdup(p));
+			p += strlen(p) + 1;
+		}
+	}
+#endif
+
 	for (i = 0; i < npaths; i++) {
 		DIR *dir;
 		struct dirent *next;
@@ -801,7 +855,7 @@ static NOINLINE unsigned complete_cmd_dir_file(const char *command, int type)
 			if (!pfind[0] && DOT_OR_DOTDOT(name_found))
 				continue;
 			/* match? */
-			if (strncmp(name_found, pfind, pf_len) != 0)
+			if (!is_prefixed_with(name_found, pfind))
 				continue; /* no */
 
 			found = concat_path_file(paths[i], name_found);
@@ -810,6 +864,9 @@ static NOINLINE unsigned complete_cmd_dir_file(const char *command, int type)
 			 * we still match dangling links */
 			if (stat(found, &st) && lstat(found, &st))
 				goto cont; /* hmm, remove in progress? */
+
+			if (type == FIND_EXE_ONLY && !file_is_executable(found))
+				goto cont;
 
 			/* Save only name */
 			len = strlen(name_found);
@@ -1261,14 +1318,16 @@ line_input_t* FAST_FUNC new_line_input_t(int flags)
 {
 	line_input_t *n = xzalloc(sizeof(*n));
 	n->flags = flags;
+#if MAX_HISTORY > 0
 	n->max_history = MAX_HISTORY;
+#endif
 	return n;
 }
 
 
 #if MAX_HISTORY > 0
 
-unsigned size_from_HISTFILESIZE(const char *hp)
+unsigned FAST_FUNC size_from_HISTFILESIZE(const char *hp)
 {
 	int size = MAX_HISTORY;
 	if (hp) {
@@ -1321,6 +1380,17 @@ static int get_next_history(void)
 	}
 	beep();
 	return 0;
+}
+
+/* Lists command history. Used by shell 'history' builtins */
+void FAST_FUNC show_history(const line_input_t *st)
+{
+	int i;
+
+	if (!st)
+		return;
+	for (i = 0; i < st->cnt_history; i++)
+		printf("%4d %s\n", i, st->history[i]);
 }
 
 # if ENABLE_FEATURE_EDITING_SAVEHISTORY
@@ -1762,34 +1832,36 @@ static void ask_terminal(void)
 #define ask_terminal() ((void)0)
 #endif
 
+/* Called just once at read_line_input() init time */
 #if !ENABLE_FEATURE_EDITING_FANCY_PROMPT
 static void parse_and_put_prompt(const char *prmt_ptr)
 {
+	const char *p;
 	cmdedit_prompt = prmt_ptr;
-	cmdedit_prmt_len = strlen(prmt_ptr);
+	p = strrchr(prmt_ptr, '\n');
+	cmdedit_prmt_len = unicode_strwidth(p ? p+1 : prmt_ptr);
 	put_prompt();
 }
 #else
 static void parse_and_put_prompt(const char *prmt_ptr)
 {
-	int prmt_len = 0;
-	size_t cur_prmt_len = 0;
-	char flg_not_length = '[';
+	int prmt_size = 0;
 	char *prmt_mem_ptr = xzalloc(1);
 # if ENABLE_USERNAME_OR_HOMEDIR
 	char *cwd_buf = NULL;
 # endif
-	char timebuf[sizeof("HH:MM:SS")];
+	char flg_not_length = '[';
 	char cbuf[2];
-	char c;
-	char *pbuf;
 
-	cmdedit_prmt_len = 0;
+	/*cmdedit_prmt_len = 0; - already is */
 
 	cbuf[1] = '\0'; /* never changes */
 
 	while (*prmt_ptr) {
+		char timebuf[sizeof("HH:MM:SS")];
 		char *free_me = NULL;
+		char *pbuf;
+		char c;
 
 		pbuf = cbuf;
 		c = *prmt_ptr++;
@@ -1873,19 +1945,25 @@ static void parse_and_put_prompt(const char *prmt_ptr)
 						cwd_buf = xrealloc_getcwd_or_warn(NULL);
 						if (!cwd_buf)
 							cwd_buf = (char *)bb_msg_unknown;
-						else {
+						else if (home_pwd_buf[0]) {
+							char *after_home_user;
+
 							/* /home/user[/something] -> ~[/something] */
+#if !ENABLE_PLATFORM_MINGW32
+							after_home_user = is_prefixed_with(cwd_buf, home_pwd_buf);
+#else
+							after_home_user = NULL;
 							l = strlen(home_pwd_buf);
 							if (l != 0
-#if !ENABLE_PLATFORM_MINGW32
-							 && strncmp(home_pwd_buf, cwd_buf, l) == 0
-#else
-							 && strncasecmp(home_pwd_buf, cwd_buf, l) == 0
+							 && strncasecmp(home_pwd_buf, cwd_buf, l) == 0) {
+								after_home_user = cwd_buf + l;
+							}
 #endif
-							 && (cwd_buf[l] == '/' || cwd_buf[l] == '\0')
+							if (after_home_user
+							 && (*after_home_user == '/' || *after_home_user == '\0')
 							) {
 								cwd_buf[0] = '~';
-								overlapping_strcpy(cwd_buf + 1, cwd_buf + l);
+								overlapping_strcpy(cwd_buf + 1, after_home_user);
 							}
 						}
 					}
@@ -1922,7 +2000,8 @@ static void parse_and_put_prompt(const char *prmt_ptr)
 				}
 				case '[': case ']':
 					if (c == flg_not_length) {
-						flg_not_length = (flg_not_length == '[' ? ']' : '[');
+						/* Toggle '['/']' hex 5b/5d */
+						flg_not_length ^= 6;
 						continue;
 					}
 					break;
@@ -1930,11 +2009,22 @@ static void parse_and_put_prompt(const char *prmt_ptr)
 			} /* if */
 		} /* if */
 		cbuf[0] = c;
-		cur_prmt_len = strlen(pbuf);
-		prmt_len += cur_prmt_len;
-		if (flg_not_length != ']')
-			cmdedit_prmt_len += cur_prmt_len;
-		prmt_mem_ptr = strcat(xrealloc(prmt_mem_ptr, prmt_len+1), pbuf);
+		{
+			int n = strlen(pbuf);
+			prmt_size += n;
+			if (c == '\n')
+				cmdedit_prmt_len = 0;
+			else if (flg_not_length != ']') {
+#if 0 /*ENABLE_UNICODE_SUPPORT*/
+/* Won't work, pbuf is one BYTE string here instead of an one Unicode char string. */
+/* FIXME */
+				cmdedit_prmt_len += unicode_strwidth(pbuf);
+#else
+				cmdedit_prmt_len += n;
+#endif
+			}
+		}
+		prmt_mem_ptr = strcat(xrealloc(prmt_mem_ptr, prmt_size+1), pbuf);
 		free(free_me);
 	} /* while */
 
@@ -2003,7 +2093,15 @@ static int lineedit_read_key(char *read_key_buffer, int timeout)
 			S.sent_ESC_br6n = 0;
 			if (cursor == 0) { /* otherwise it may be bogus */
 				int col = ((ic >> 32) & 0x7fff) - 1;
-				if (col > cmdedit_prmt_len) {
+				/*
+				 * Is col > cmdedit_prmt_len?
+				 * If yes (terminal says cursor is farther to the right
+				 * of where we think it should be),
+				 * the prompt wasn't printed starting at col 1,
+				 * there was additional text before it.
+				 */
+				if ((int)(col - cmdedit_prmt_len) > 0) {
+					/* Fix our understanding of current x position */
 					cmdedit_x += (col - cmdedit_prmt_len);
 					while (cmdedit_x >= cmdedit_termw) {
 						cmdedit_x -= cmdedit_termw;
@@ -2094,6 +2192,7 @@ static int32_t reverse_i_search(void)
 	char read_key_buffer[KEYCODE_BUFFER_SIZE];
 	const char *matched_history_line;
 	const char *saved_prompt;
+	unsigned saved_prmt_len;
 	int32_t ic;
 
 	matched_history_line = NULL;
@@ -2102,6 +2201,7 @@ static int32_t reverse_i_search(void)
 
 	/* Save and replace the prompt */
 	saved_prompt = cmdedit_prompt;
+	saved_prmt_len = cmdedit_prmt_len;
 	goto set_prompt;
 
 	while (1) {
@@ -2177,7 +2277,7 @@ static int32_t reverse_i_search(void)
 					free((char*)cmdedit_prompt);
  set_prompt:
 					cmdedit_prompt = xasprintf("(reverse-i-search)'%s': ", match_buf);
-					cmdedit_prmt_len = strlen(cmdedit_prompt);
+					cmdedit_prmt_len = unicode_strwidth(cmdedit_prompt);
 					goto do_redraw;
 				}
 			}
@@ -2199,7 +2299,7 @@ static int32_t reverse_i_search(void)
 
 	free((char*)cmdedit_prompt);
 	cmdedit_prompt = saved_prompt;
-	cmdedit_prmt_len = strlen(cmdedit_prompt);
+	cmdedit_prmt_len = saved_prmt_len;
 	redraw(cmdedit_y, command_len - cursor);
 
 	return ic;
@@ -2229,16 +2329,20 @@ int FAST_FUNC read_line_input(line_input_t *st, const char *prompt, char *comman
 	INIT_S();
 
 #if ENABLE_PLATFORM_MINGW32
-	memset(initial_settings.c_cc, sizeof(initial_settings.c_cc), 0);
+	memset(initial_settings.c_cc, 0, sizeof(initial_settings.c_cc));
 	initial_settings.c_cc[VINTR] = CTRL('C');
 	initial_settings.c_cc[VEOF] = CTRL('D');
 	if (!isatty(0) || !isatty(1)) {
 #else
 	if (tcgetattr(STDIN_FILENO, &initial_settings) < 0
-	 || !(initial_settings.c_lflag & ECHO)
+	 || (initial_settings.c_lflag & (ECHO|ICANON)) == ICANON
 	) {
 #endif
-		/* Happens when e.g. stty -echo was run before */
+		/* Happens when e.g. stty -echo was run before.
+		 * But if ICANON is not set, we don't come here.
+		 * (example: interactive python ^Z-backgrounded,
+		 * tty is still in "raw mode").
+		 */
 		parse_and_put_prompt(prompt);
 		/* fflush_all(); - done by parse_and_put_prompt */
 		if (fgets(command, maxsize, stdin) == NULL)
@@ -2587,7 +2691,7 @@ int FAST_FUNC read_line_input(line_input_t *st, const char *prompt, char *comman
 			 * standard readline bindings (IOW: bash) do.
 			 * Often, Alt-<key> generates ESC-<key>.
 			 */
-			ic = lineedit_read_key(read_key_buffer, timeout);
+			ic = lineedit_read_key(read_key_buffer, 20);
 			switch (ic) {
 				//case KEYCODE_LEFT: - bash doesn't do this
 				case 'b':
@@ -2774,8 +2878,9 @@ int FAST_FUNC read_line_input(line_input_t *st, const char *prompt, char *comman
 	free(command_ps);
 #endif
 
-	if (command_len > 0)
+	if (command_len > 0) {
 		remember_in_history(command);
+	}
 
 	if (break_out > 0) {
 		command[command_len++] = '\n';

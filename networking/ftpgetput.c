@@ -62,9 +62,6 @@ struct globals {
 } FIX_ALIASING;
 #define G (*(struct globals*)&bb_common_bufsiz1)
 enum { BUFSZ = COMMON_BUFSIZE - offsetof(struct globals, buf) };
-struct BUG_G_too_big {
-	char BUG_G_too_big[sizeof(G) <= COMMON_BUFSIZE ? 1 : -1];
-};
 #define user           (G.user          )
 #define password       (G.password      )
 #define lsa            (G.lsa           )
@@ -72,7 +69,9 @@ struct BUG_G_too_big {
 #define verbose_flag   (G.verbose_flag  )
 #define do_continue    (G.do_continue   )
 #define buf            (G.buf           )
-#define INIT_G() do { } while (0)
+#define INIT_G() do { \
+	BUILD_BUG_ON(sizeof(G) > COMMON_BUFSIZE); \
+} while (0)
 
 
 static void ftp_die(const char *msg) NORETURN;
@@ -100,6 +99,9 @@ static int ftpcmd(const char *s1, const char *s2)
 		fprintf(control_stream, (s2 ? "%s %s\r\n" : "%s %s\r\n"+3),
 						s1, s2);
 		fflush(control_stream);
+#if ENABLE_PLATFORM_MINGW32
+		fseek(control_stream, 0L, SEEK_CUR);
+#endif
 	}
 
 	do {
@@ -108,6 +110,9 @@ static int ftpcmd(const char *s1, const char *s2)
 			ftp_die(NULL);
 		}
 	} while (!isdigit(buf[0]) || buf[3] != ' ');
+#if ENABLE_PLATFORM_MINGW32
+	fseek(control_stream, 0L, SEEK_CUR);
+#endif
 
 	buf[3] = '\0';
 	n = xatou(buf);

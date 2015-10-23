@@ -9,6 +9,18 @@
  *
  * Licensed under GPLv2, see file LICENSE in this source tree.
  */
+//config:config CRYPTPW
+//config:	bool "cryptpw"
+//config:	default y
+//config:	help
+//config:	  Encrypts the given password with the crypt(3) libc function
+//config:	  using the given salt. Debian has this utility under mkpasswd
+//config:	  name. Busybox provides mkpasswd as an alias for cryptpw.
+
+//applet:IF_CRYPTPW(APPLET(cryptpw, BB_DIR_USR_BIN, BB_SUID_DROP))
+//applet:IF_CRYPTPW(APPLET_ODDNAME(mkpasswd, cryptpw, BB_DIR_USR_BIN, BB_SUID_DROP, mkpasswd))
+
+//kbuild:lib-$(CONFIG_CRYPTPW) += cryptpw.o
 
 //usage:#define cryptpw_trivial_usage
 //usage:       "[OPTIONS] [PASSWORD] [SALT]"
@@ -92,6 +104,7 @@ int cryptpw_main(int argc UNUSED_PARAM, char **argv)
 {
 	char salt[MAX_PW_SALT_LEN];
 	char *salt_ptr;
+	char *password;
 	const char *opt_m, *opt_S;
 	int fd;
 
@@ -123,15 +136,19 @@ int cryptpw_main(int argc UNUSED_PARAM, char **argv)
 
 	xmove_fd(fd, STDIN_FILENO);
 
-	puts(pw_encrypt(
-		argv[0] ? argv[0] : (
-			/* Only mkpasswd, and only from tty, prompts.
-			 * Otherwise it is a plain read. */
-			(isatty(STDIN_FILENO) && applet_name[0] == 'm')
+	password = argv[0];
+	if (!password) {
+		/* Only mkpasswd, and only from tty, prompts.
+		 * Otherwise it is a plain read. */
+		password = (isatty(STDIN_FILENO) && applet_name[0] == 'm')
 			? bb_ask_stdin("Password: ")
 			: xmalloc_fgetline(stdin)
-		),
-		salt, 1));
+		;
+		/* may still be NULL on EOF/error */
+	}
+
+	if (password)
+		puts(pw_encrypt(password, salt, 1));
 
 	return EXIT_SUCCESS;
 }

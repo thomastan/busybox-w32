@@ -26,7 +26,6 @@ ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
 /* Busyboxed by Denys Vlasenko <vda.linux@googlemail.com> */
-/* TODO: depends on runit_lib.c - review and reduce/eliminate */
 
 /*
 Config files
@@ -125,6 +124,18 @@ log message, you can use a pattern like this instead
 -*: *: pid *
 */
 
+//config:config SVLOGD
+//config:	bool "svlogd"
+//config:	default y
+//config:	help
+//config:	  svlogd continuously reads log data from its standard input, optionally
+//config:	  filters log messages, and writes the data to one or more automatically
+//config:	  rotated logs.
+
+//applet:IF_SVLOGD(APPLET(svlogd, BB_DIR_USR_SBIN, BB_SUID_DROP))
+
+//kbuild:lib-$(CONFIG_SVLOGD) += svlogd.o
+
 //usage:#define svlogd_trivial_usage
 //usage:       "[-ttv] [-r C] [-R CHARS] [-l MATCHLEN] [-b BUFLEN] DIR..."
 //usage:#define svlogd_full_usage "\n\n"
@@ -142,7 +153,6 @@ log message, you can use a pattern like this instead
 //usage:   "\n""+,-PATTERN - (de)select line for logging"
 //usage:   "\n""E,ePATTERN - (de)select line for stderr"
 
-#include <sys/poll.h>
 #include <sys/file.h>
 #include "libbb.h"
 #include "runit_lib.h"
@@ -745,11 +755,6 @@ static NOINLINE unsigned logdir_open(struct logdir *ld, const char *fn)
 				ld->inst = new;
 				break;
 			case 's': {
-				static const struct suffix_mult km_suffixes[] = {
-					{ "k", 1024 },
-					{ "m", 1024*1024 },
-					{ "", 0 }
-				};
 				ld->sizemax = xatou_sfx(&s[1], km_suffixes);
 				break;
 			}

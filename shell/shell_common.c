@@ -18,11 +18,13 @@
  */
 #include "libbb.h"
 #include "shell_common.h"
-#if !ENABLE_PLATFORM_MINGW32
 #include <sys/resource.h> /* getrlimit */
-#endif
 
+#if !ENABLE_PLATFORM_MINGW32
 const char defifsvar[] ALIGN1 = "IFS= \t\n";
+#else
+const char defifsvar[] ALIGN1 = "IFS= \t\n\r";
+#endif
 
 
 int FAST_FUNC is_well_formed_var_name(const char *s, char terminator)
@@ -39,7 +41,7 @@ int FAST_FUNC is_well_formed_var_name(const char *s, char terminator)
 
 /* read builtin */
 
-/* Needs to be interruptible: shell mush handle traps and shell-special signals
+/* Needs to be interruptible: shell must handle traps and shell-special signals
  * while inside read. To implement this, be sure to not loop on EINTR
  * and return errno == EINTR reliably.
  */
@@ -188,6 +190,7 @@ shell_builtin_read(void FAST_FUNC (*setvar)(const char *name, const char *val),
 		 * regardless of SA_RESTART-ness of that signal!
 		 */
 		errno = 0;
+#if !ENABLE_PLATFORM_MINGW32
 		pfd[0].fd = fd;
 		pfd[0].events = POLLIN;
 		if (poll(pfd, 1, timeout) != 1) {
@@ -196,6 +199,7 @@ shell_builtin_read(void FAST_FUNC (*setvar)(const char *name, const char *val),
 			retval = (const char *)(uintptr_t)1;
 			goto ret;
 		}
+#endif
 		if (read(fd, &buffer[bufpos], 1) != 1) {
 			err = errno;
 			retval = (const char *)(uintptr_t)1;
@@ -275,6 +279,7 @@ shell_builtin_read(void FAST_FUNC (*setvar)(const char *name, const char *val),
 
 /* ulimit builtin */
 
+#if !ENABLE_PLATFORM_MINGW32
 struct limits {
 	uint8_t cmd;            /* RLIMIT_xxx fit into it */
 	uint8_t factor_shift;   /* shift by to get rlim_{cur,max} values */
@@ -372,13 +377,6 @@ static const char ulimit_opt_string[] = "-HSa"
 #endif
 			;
 
-#if ENABLE_PLATFORM_MINGW32
-int FAST_FUNC
-shell_builtin_ulimit(char **argv)
-{
-	return 1;
-}
-#else
 static void printlim(unsigned opts, const struct rlimit *limit,
 			const struct limits *l)
 {
@@ -389,7 +387,7 @@ static void printlim(unsigned opts, const struct rlimit *limit,
 		val = limit->rlim_cur;
 
 	if (val == RLIM_INFINITY)
-		printf("unlimited\n");
+		puts("unlimited");
 	else {
 		val >>= l->factor_shift;
 		printf("%llu\n", (long long) val);
@@ -502,9 +500,13 @@ shell_builtin_ulimit(char **argv)
 			/* bad option. getopt already complained. */
 			break;
 		}
-
 	} /* while (there are options) */
 
 	return 0;
+}
+#else
+int FAST_FUNC shell_builtin_ulimit(char **argv UNUSED_PARAM)
+{
+	return 1;
 }
 #endif

@@ -9,10 +9,16 @@
 /*
  Functions to be wrapped:
 */
+#undef vprintf
 #undef printf
 #undef fprintf
 #undef fputs
-/* TODO: write */
+#undef putchar
+#undef fwrite
+#undef puts
+#undef write
+#undef read
+#undef getc
 
 /*
  ANSI codes used by git: m, K
@@ -22,6 +28,7 @@
 */
 
 static HANDLE console;
+static HANDLE console_in;
 static WORD plain_attr;
 static WORD attr;
 static int negative;
@@ -33,6 +40,10 @@ static void init(void)
 	static int initialized = 0;
 	if (initialized)
 		return;
+
+	console_in = GetStdHandle(STD_INPUT_HANDLE);
+	if (console_in == INVALID_HANDLE_VALUE)
+		console_in = NULL;
 
 	console = GetStdHandle(STD_OUTPUT_HANDLE);
 	if (console == INVALID_HANDLE_VALUE)
@@ -90,6 +101,9 @@ static void erase_in_line(void)
 	FillConsoleOutputCharacterA(console, ' ',
 		sbi.dwSize.X - sbi.dwCursorPosition.X, sbi.dwCursorPosition,
 		&dummy);
+	FillConsoleOutputAttribute(console, plain_attr,
+		sbi.dwSize.X - sbi.dwCursorPosition.X, sbi.dwCursorPosition,
+		&dummy);
 }
 
 static void erase_till_end_of_screen(void)
@@ -105,14 +119,20 @@ static void erase_till_end_of_screen(void)
 	FillConsoleOutputCharacterA(console, ' ',
 		sbi.dwSize.X - sbi.dwCursorPosition.X, sbi.dwCursorPosition,
 		&dummy);
+	FillConsoleOutputAttribute(console, plain_attr,
+		sbi.dwSize.X - sbi.dwCursorPosition.X, sbi.dwCursorPosition,
+		&dummy);
 
 	pos.X = 0;
-	for (pos.Y = sbi.dwCursorPosition.Y+1; pos.Y < sbi.dwSize.Y; pos.Y++)
+	for (pos.Y = sbi.dwCursorPosition.Y+1; pos.Y < sbi.dwSize.Y; pos.Y++) {
 		FillConsoleOutputCharacterA(console, ' ', sbi.dwSize.X,
 					    pos, &dummy);
+		FillConsoleOutputAttribute(console, plain_attr, sbi.dwSize.X,
+					    pos, &dummy);
+	}
 }
 
-static void move_cursor_back(int n)
+static void move_cursor_row(int n)
 {
 	CONSOLE_SCREEN_BUFFER_INFO sbi;
 
@@ -120,7 +140,19 @@ static void move_cursor_back(int n)
 		return;
 
 	GetConsoleScreenBufferInfo(console, &sbi);
-	sbi.dwCursorPosition.X -= n;
+	sbi.dwCursorPosition.Y += n;
+	SetConsoleCursorPosition(console, sbi.dwCursorPosition);
+}
+
+static void move_cursor_column(int n)
+{
+	CONSOLE_SCREEN_BUFFER_INFO sbi;
+
+	if (!console)
+		return;
+
+	GetConsoleScreenBufferInfo(console, &sbi);
+	sbi.dwCursorPosition.X += n;
 	SetConsoleCursorPosition(console, sbi.dwCursorPosition);
 }
 
@@ -274,18 +306,29 @@ static const char *set_attr(const char *str)
 
 		set_console_attr();
 		break;
-	case 'D':
-		move_cursor_back(strtol(str, (char **)&str, 10));
+	case 'A': /* up */
+		move_cursor_row(-strtol(str, (char **)&str, 10));
+		break;
+	case 'B': /* down */
+		move_cursor_row(strtol(str, (char **)&str, 10));
+		break;
+	case 'C': /* forward */
+		move_cursor_column(strtol(str, (char **)&str, 10));
+		break;
+	case 'D': /* back */
+		move_cursor_column(-strtol(str, (char **)&str, 10));
 		break;
 	case 'H':
 		if (!len)
 			move_cursor(0, 0);
 		else {
-			int row = strtol(str, (char **)&str, 10);
+			int row, col = 1;
+
+			row = strtol(str, (char **)&str, 10);
 			if (*str == ';') {
-				int col = strtol(str+1, (char **)&str, 10);
-				move_cursor(col-1, row-1);
+				col = strtol(str+1, (char **)&str, 10);
 			}
+			move_cursor(col > 0 ? col-1 : 0, row > 0 ? row-1 : 0);
 		}
 		break;
 	case 'J':
@@ -309,10 +352,37 @@ static const char *set_attr(const char *str)
 	return func + 1;
 }
 
-static int ansi_emulate(const char *str, FILE *stream)
+static int ansi_emulate(const char *s, FILE *stream)
 {
 	int rv = 0;
-	const char *pos = str;
+	const char *t;
+	char *pos, *str;
+	size_t out_len, cur_len;
+	static size_t max_len = 0;
+	static char *mem = NULL;
+
+	/* if no special treatment is required output the string as-is */
+	for ( t=s; *t; ++t ) {
+		if ( *t == '\033' || *t > 0x7f ) {
+			break;
+		}
+	}
+
+	if ( *t == '\0' ) {
+		return fputs(s, stream) == EOF ? EOF : strlen(s);
+	}
+
+	/* make a writable copy of the string and retain it for reuse */
+	cur_len = strlen(s);
+	if ( cur_len == 0  || cur_len > max_len ) {
+		free(mem);
+		mem = strdup(s);
+		max_len = cur_len;
+	}
+	else {
+		strcpy(mem, s);
+	}
+	pos = str = mem;
 
 	while (*pos) {
 		pos = strstr(str, "\033[");
@@ -320,7 +390,8 @@ static int ansi_emulate(const char *str, FILE *stream)
 			size_t len = pos - str;
 
 			if (len) {
-				size_t out_len = fwrite(str, 1, len, stream);
+				CharToOemBuff(str, str, len);
+				out_len = fwrite(str, 1, len, stream);
 				rv += out_len;
 				if (out_len < len)
 					return rv;
@@ -331,15 +402,80 @@ static int ansi_emulate(const char *str, FILE *stream)
 
 			fflush(stream);
 
-			pos = set_attr(str);
+			pos = (char *)set_attr(str);
 			rv += pos - str;
 			str = pos;
 		} else {
 			rv += strlen(str);
+			CharToOem(str, str);
 			fputs(str, stream);
 			return rv;
 		}
 	}
+	return rv;
+}
+
+int winansi_putchar(int c)
+{
+	char t = c;
+	char *s = &t;
+
+	if (!isatty(STDOUT_FILENO))
+		return putchar(c);
+
+	init();
+
+	if (!console)
+		return putchar(c);
+
+	CharToOemBuff(s, s, 1);
+	return putchar(t) == EOF ? EOF : c;
+}
+
+int winansi_puts(const char *s)
+{
+	int rv;
+
+	if (!isatty(STDOUT_FILENO))
+		return puts(s);
+
+	init();
+
+	if (!console)
+		return puts(s);
+
+	rv = ansi_emulate(s, stdout);
+	putchar('\n');
+
+	return rv;
+}
+
+size_t winansi_fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)
+{
+	size_t lsize, lmemb;
+	char *str;
+	int rv;
+
+	lsize = MIN(size, nmemb);
+	lmemb = MAX(size, nmemb);
+	if (lsize != 1)
+		return fwrite(ptr, size, nmemb, stream);
+
+	if (!isatty(fileno(stream)))
+		return fwrite(ptr, size, nmemb, stream);
+
+	init();
+
+	if (!console)
+		return fwrite(ptr, size, nmemb, stream);
+
+	str = xmalloc(lmemb+1);
+	memcpy(str, ptr, lmemb);
+	str[lmemb] = '\0';
+
+	rv = ansi_emulate(str, stream);
+	free(str);
+
 	return rv;
 }
 
@@ -363,7 +499,7 @@ int winansi_fputs(const char *str, FILE *stream)
 		return EOF;
 }
 
-static int winansi_vfprintf(FILE *stream, const char *format, va_list list)
+int winansi_vfprintf(FILE *stream, const char *format, va_list list)
 {
 	int len, rv;
 	char small_buf[256];
@@ -440,4 +576,121 @@ int winansi_get_terminal_width_height(struct winsize *win)
 	}
 
 	return ret ? 0 : -1;
+}
+
+static int ansi_emulate_write(int fd, const void *buf, size_t count)
+{
+	int rv = 0, i;
+	const char *s = (const char *)buf;
+	char *pos, *str;
+	size_t len, out_len;
+	static size_t max_len = 0;
+	static char *mem = NULL;
+
+	/* if no special treatment is required output the string as-is */
+	for ( i=0; i<count; ++i ) {
+		if ( s[i] == '\033' || s[i] > 0x7f ) {
+			break;
+		}
+	}
+
+	if ( i == count ) {
+		return write(fd, buf, count);
+	}
+
+	/* make a writable copy of the data and retain it for reuse */
+	if ( count > max_len ) {
+		free(mem);
+		mem = malloc(count+1);
+		max_len = count;
+	}
+	memcpy(mem, buf, count);
+	mem[count] = '\0';
+	pos = str = mem;
+
+	/* we're writing to the console so we assume the data isn't binary */
+	while (*pos) {
+		pos = strstr(str, "\033[");
+		if (pos) {
+			len = pos - str;
+
+			if (len) {
+				CharToOemBuff(str, str, len);
+				out_len = write(fd, str, len);
+				rv += out_len;
+				if (out_len < len)
+					return rv;
+			}
+
+			str = pos + 2;
+			rv += 2;
+
+			pos = (char *)set_attr(str);
+			rv += pos - str;
+			str = pos;
+		} else {
+			len = strlen(str);
+			rv += len;
+			CharToOem(str, str);
+			write(fd, str, len);
+			return rv;
+		}
+	}
+	return rv;
+}
+
+int winansi_write(int fd, const void *buf, size_t count)
+{
+	if (!isatty(fd))
+		return write(fd, buf, count);
+
+	init();
+
+	if (!console)
+		return write(fd, buf, count);
+
+	return ansi_emulate_write(fd, buf, count);
+}
+
+int winansi_read(int fd, void *buf, size_t count)
+{
+	int rv;
+
+	rv = read(fd, buf, count);
+	if (!isatty(fd))
+		return rv;
+
+	init();
+
+	if (!console_in)
+		return rv;
+
+	if ( rv > 0 ) {
+		OemToCharBuff(buf, buf, rv);
+	}
+
+	return rv;
+}
+
+int winansi_getc(FILE *stream)
+{
+	int rv;
+
+	rv = getc(stream);
+	if (!isatty(fileno(stream)))
+		return rv;
+
+	init();
+
+	if (!console_in)
+		return rv;
+
+	if ( rv != EOF ) {
+		unsigned char c = (unsigned char)rv;
+		char *s = (char *)&c;
+		OemToCharBuff(s, s, 1);
+		rv = (int)c;
+	}
+
+	return rv;
 }

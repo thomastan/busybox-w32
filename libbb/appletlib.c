@@ -29,7 +29,7 @@
 #include "busybox.h"
 
 #if !(defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) \
-        || defined(__APPLE__) \
+    || defined(__APPLE__) \
     )
 # include <malloc.h> /* for mallopt */
 #endif
@@ -62,6 +62,7 @@ static const char usage_messages[] ALIGN1 = UNPACKED_USAGE;
 #if ENABLE_FEATURE_COMPRESS_USAGE
 
 static const char packed_usage[] ALIGN1 = { PACKED_USAGE };
+#define BB_ARCHIVE_PUBLIC
 # include "bb_archive.h"
 static const char *unpack_usage_messages(void)
 {
@@ -130,7 +131,7 @@ void FAST_FUNC bb_show_usage(void)
 			full_write2_str(applet_name);
 			full_write2_str(" ");
 			full_write2_str(p);
-			full_write2_str("\n\n");
+			full_write2_str("\n");
 		}
 		if (ENABLE_FEATURE_CLEAN_UP)
 			dealloc_usage_messages((char*)usage_string);
@@ -184,11 +185,12 @@ void lbb_prepare(const char *applet
 #endif
 	applet_name = applet;
 
-	/* Set locale for everybody except 'init' */
-	if (ENABLE_LOCALE_SUPPORT && getpid() != 1)
+	if (ENABLE_LOCALE_SUPPORT)
 		setlocale(LC_ALL, "");
 
-	IF_WIN32_NET(init_winsock();)
+#if ENABLE_PLATFORM_MINGW32
+	init_winsock();
+#endif
 
 #if ENABLE_FEATURE_INDIVIDUAL
 	/* Redundant for busybox (run_applet_and_exit covers that case)
@@ -196,7 +198,7 @@ void lbb_prepare(const char *applet
 	if (argv[1]
 	 && !argv[2]
 	 && strcmp(argv[1], "--help") == 0
-	 && strncmp(applet, "busybox", 7) != 0
+	 && !is_prefixed_with(applet, "busybox")
 	) {
 		/* Special case. POSIX says "test --help"
 		 * should be no different from e.g. "test --foo".  */
@@ -440,7 +442,7 @@ static void parse_config_file(void)
 						goto pe_label;
 					}
 					*e = ':'; /* get_uidgid needs USER:GROUP syntax */
-					if (get_uidgid(&sct->m_ugid, s, /*allow_numeric:*/ 1) == 0) {
+					if (get_uidgid(&sct->m_ugid, s) == 0) {
 						errmsg = "unknown user/group";
 						goto pe_label;
 					}
@@ -460,7 +462,6 @@ static void parse_config_file(void)
 			errmsg = "keyword outside section";
 			goto pe_label;
 		}
-
 	} /* while (1) */
 
  pe_label:
@@ -608,7 +609,11 @@ static void install_links(const char *busybox, int use_symbolic_links,
 	}
 }
 # else
-#  define install_links(x,y,z) ((void)0)
+static void install_links(const char *busybox UNUSED_PARAM,
+		int use_symbolic_links UNUSED_PARAM,
+		char *custom_install_dir UNUSED_PARAM)
+{
+}
 # endif
 
 /* If we were called as "busybox..." */
@@ -629,8 +634,13 @@ static int busybox_main(char **argv)
 		dup2(1, 2);
 		full_write2_str(bb_banner); /* reuse const string */
 		full_write2_str(" multi-call binary.\n"); /* reuse */
+#if defined(MINGW_VER)
+		if (strlen(MINGW_VER)) {
+			full_write2_str(MINGW_VER "\n\n");
+		}
+#endif
 		full_write2_str(
-			"BusyBox is copyrighted by many authors between 1998-2012.\n"
+			"BusyBox is copyrighted by many authors between 1998-2015.\n"
 			"Licensed under GPLv2. See source distribution for detailed\n"
 			"copyright notices.\n"
 			"\n"
@@ -641,11 +651,25 @@ static int busybox_main(char **argv)
 			)
 			"   or: function [arguments]...\n"
 			"\n"
+			IF_NOT_FEATURE_SH_STANDALONE(
 			"\tBusyBox is a multi-call binary that combines many common Unix\n"
 			"\tutilities into a single executable.  Most people will create a\n"
 			"\tlink to busybox for each function they wish to use and BusyBox\n"
 			"\twill act like whatever it was invoked as.\n"
+			)
+			IF_FEATURE_SH_STANDALONE(
+			"\tBusyBox is a multi-call binary that combines many common Unix\n"
+			"\tutilities into a single executable.  The shell in this version\n"
+			"\thas been configured to prefer built-in utilities to external\n"
+			"\tbinaries.  This avoids having to install a link to busybox for\n"
+			"\teach function to be invoked.\n"
+			)
 			"\n"
+#if ENABLE_GLOBBING
+			"\tSupport for native Windows wildcards is enabled.  In some\n"
+			"\tcases this may result in wildcards being processed twice.\n"
+			"\n"
+#endif
 			"Currently defined functions:\n"
 		);
 		col = 0;
@@ -672,7 +696,7 @@ static int busybox_main(char **argv)
 		return 0;
 	}
 
-	if (strncmp(argv[1], "--list", 6) == 0) {
+	if (is_prefixed_with(argv[1], "--list")) {
 		unsigned i = 0;
 		const char *a = applet_names;
 		dup2(1, 2);
@@ -732,7 +756,8 @@ static int busybox_main(char **argv)
 	/*bb_error_msg_and_die("applet not found"); - sucks in printf */
 	full_write2_str(applet_name);
 	full_write2_str(": applet not found\n");
-	xfunc_die();
+	/* POSIX: "If a command is not found, the exit status shall be 127" */
+	exit(127);
 }
 
 void FAST_FUNC run_applet_no_and_exit(int applet_no, char **argv)
@@ -744,14 +769,26 @@ void FAST_FUNC run_applet_no_and_exit(int applet_no, char **argv)
 
 	/* Reinit some shared global data */
 	xfunc_error_retval = EXIT_FAILURE;
-
 	applet_name = APPLET_NAME(applet_no);
-	if (argc == 2 && strcmp(argv[1], "--help") == 0) {
-		/* Special case. POSIX says "test --help"
-		 * should be no different from e.g. "test --foo".  */
-//TODO: just compare applet_no with APPLET_NO_test
-		if (!ENABLE_TEST || strcmp(applet_name, "test") != 0) {
-			/* If you want "foo --help" to return 0: */
+
+	/* Special case. POSIX says "test --help"
+	 * should be no different from e.g. "test --foo".
+	 * Thus for "test", we skip --help check.
+	 * "true" and "false" are also special.
+	 */
+	if (1
+#if defined APPLET_NO_test
+	 && applet_no != APPLET_NO_test
+#endif
+#if defined APPLET_NO_true
+	 && applet_no != APPLET_NO_true
+#endif
+#if defined APPLET_NO_false
+	 && applet_no != APPLET_NO_false
+#endif
+	) {
+		if (argc == 2 && strcmp(argv[1], "--help") == 0) {
+			/* Make "foo --help" exit with 0: */
 			xfunc_error_retval = 0;
 			bb_show_usage();
 		}
@@ -766,7 +803,7 @@ void FAST_FUNC run_applet_and_exit(const char *name, char **argv)
 	int applet = find_applet_by_name(name);
 	if (applet >= 0)
 		run_applet_no_and_exit(applet, argv);
-	if (strncmp(name, "busybox", 7) == 0)
+	if (is_prefixed_with(name, "busybox"))
 		exit(busybox_main(argv));
 }
 
@@ -777,11 +814,6 @@ void FAST_FUNC run_applet_and_exit(const char *name, char **argv)
 #if ENABLE_BUILD_LIBBUSYBOX
 int lbb_main(char **argv)
 #else
-#if ENABLE_NOGLOB
-/* disable MSVCRT command line globbing */
-int _CRT_glob = 0;
-#endif
-
 int main(int argc UNUSED_PARAM, char **argv)
 #endif
 {
@@ -808,9 +840,21 @@ int main(int argc UNUSED_PARAM, char **argv)
 	}
 #endif
 
+#if defined(__MINGW64_VERSION_MAJOR)
+	if ( stdin ) {
+		_setmode(fileno(stdin), _O_BINARY);
+	}
+	if ( stdout ) {
+		_setmode(fileno(stdout), _O_BINARY);
+	}
+	if ( stderr ) {
+		_setmode(fileno(stderr), _O_BINARY);
+	}
+#endif
+
 #if defined(SINGLE_APPLET_MAIN)
 	/* Only one applet is selected in .config */
-	if (argv[1] && strncmp(argv[0], "busybox", 7) == 0) {
+	if (argv[1] && is_prefixed_with(argv[0], "busybox")) {
 		/* "busybox <applet> <params>" should still work as expected */
 		argv++;
 	}
@@ -829,14 +873,21 @@ int main(int argc UNUSED_PARAM, char **argv)
 			applet_name = applet_name_env;
 			unsetenv("BUSYBOX_APPLET_NAME");
 		}
+		else if ( argv[1] && argv[2] && strcmp(argv[1], "--busybox") == 0 ) {
+			argv += 2;
+			applet_name = argv[0];
+		}
 		else {
-			int i, len = strlen(applet_name);
-			if (len > 4 && !strcmp(applet_name+len-4, ".exe")) {
-				len -= 4;
-				argv[0][applet_name-argv[0]+len] = '\0';
+			char *s = argv[0];
+			int i, len = strlen(s);
+
+			for ( i=0; i < len; ++i ) {
+				s[i] = tolower(s[i]);
 			}
-			for (i = 0; i < len; i++)
-				argv[0][applet_name-argv[0]+i] = tolower(applet_name[i]);
+			if (len > 4 && !strcmp(s+len-4, ".exe")) {
+				len -= 4;
+				s[len] = '\0';
+			}
 		}
 	}
 	applet_name = bb_basename(applet_name);
@@ -848,6 +899,7 @@ int main(int argc UNUSED_PARAM, char **argv)
 	/*bb_error_msg_and_die("applet not found"); - sucks in printf */
 	full_write2_str(applet_name);
 	full_write2_str(": applet not found\n");
-	xfunc_die();
+	/* POSIX: "If a command is not found, the exit status shall be 127" */
+	exit(127);
 #endif
 }

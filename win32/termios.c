@@ -10,12 +10,13 @@ int tcgetattr(int fd UNUSED_PARAM, struct termios *t UNUSED_PARAM)
 	return -1;
 }
 
-int64_t FAST_FUNC read_key(int fd, char *buf, int timeout)
+int64_t FAST_FUNC read_key(int fd, char *buf UNUSED_PARAM, int timeout)
 {
 	HANDLE cin = GetStdHandle(STD_INPUT_HANDLE);
 	INPUT_RECORD record;
 	DWORD nevent_out, mode;
 	int ret = -1;
+	char *s;
 
 	if (fd != 0)
 		bb_error_msg_and_die("read_key only works on stdin");
@@ -66,13 +67,12 @@ int64_t FAST_FUNC read_key(int fd, char *buf, int timeout)
 			case VK_END: ret = KEYCODE_END; goto done;
 			case VK_PRIOR: ret = KEYCODE_PAGEUP; goto done;
 			case VK_NEXT: ret = KEYCODE_PAGEDOWN; goto done;
-			case VK_CAPITAL:
-			case VK_SHIFT:
-			case VK_CONTROL:
-			case VK_MENU:
-				break;
 			}
 			continue;
+		}
+		if ( (record.Event.KeyEvent.uChar.AsciiChar & 0x80) == 0x80 ) {
+			s = &record.Event.KeyEvent.uChar.AsciiChar;
+			OemToCharBuff(s, s, 1);
 		}
 		ret = record.Event.KeyEvent.uChar.AsciiChar;
 		break;
